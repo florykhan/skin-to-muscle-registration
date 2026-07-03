@@ -1,4 +1,4 @@
-# maya_scenes
+# Maya Scenes
 
 This folder is a placeholder for the Autodesk Maya scene files used by the
 registration workflow.
