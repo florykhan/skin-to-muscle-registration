@@ -1,0 +1,37 @@
+commandPort -name "localhost:7001" -sourceType "mel";
+
+9
+next task will use:
+s37 as the opening start mb file for the registration.
+setup_target_registration()
+apply_all_contour_landmarks()
+run_shrinkwrap(400)
+
+but save only every 200 iterations
+
+
+the resume work:
+after 4000 i
+
+setup_target_registration()
+apply_all_contour_landmarks()
+run_shrinkwrap(9600)
+
+
+10
+the results:
+decided that iteration 1600 is the sweet point.
+Using this file:
+"C:\keyLabLocal_D\c99-maya-ziva-workshop\experiment_files\s37 target_shrinkwrap_saves V2 added braking zone continued from 400 iter\iter_1200.mb"
+
+
+see slide 408
+
+11
+for reproduction use:
+"C:\keyLabLocal_D\c99-maya-ziva-workshop\experiment_files\s24 paused at 463 iterations.mb"
+this is the circa 400 file.
+
+
+12 the start point of the registration is:
+"C:\keyLabLocal_D\c99-maya-ziva-workshop\experiment_files\s37 repaired the lower lip not match issue.mb"
