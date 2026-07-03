@@ -1,0 +1,10 @@
+# Optional external Python packages used by d98-target_shrinkwrap_registration.py.
+#
+# NOTE: The script runs inside Autodesk Maya and relies on Maya's bundled Python
+# modules (maya.cmds, maya.api.OpenMaya), which are NOT installed via pip and are
+# therefore not listed here.
+#
+# The packages below are optional. If matplotlib is unavailable, the script still
+# runs but convergence plotting is disabled.
+
+matplotlib

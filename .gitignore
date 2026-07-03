@@ -1,0 +1,78 @@
+# =============================================================================
+# Python
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.env
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# =============================================================================
+# Autodesk Maya
+# =============================================================================
+# Large Maya scene files (share via approved storage, not Git)
+*.mb
+*.ma
+
+# Maya backup / swap / temp files
+*.mb.tmp
+*.ma.tmp
+*.swatches
+mayaSwatches/
+*.bak
+
+# Maya autosave / incremental / generated saves
+incrementalSave/
+*/incrementalSave/
+autosave/
+*_saves/
+*_saves*/
+iter_*.mb
+iter_*.ma
+
+# Maya cache / project workspace clutter
+cache/
+sceneAssembly/
+data/
+Time Editor/
+*.abc
+*.mcx
+*.mcc
+*.xml.tmp
+
+# =============================================================================
+# Large model / asset folders (require approval before committing)
+# =============================================================================
+models/
+assets/
+sourceimages/
+textures/
+
+# =============================================================================
+# Private / local notes (not for publication)
+# =============================================================================
+Useful Notes/
+
+# =============================================================================
+# OS files
+# =============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
