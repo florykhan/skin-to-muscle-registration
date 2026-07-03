@@ -44,6 +44,58 @@ except ImportError:
 
 
 # =============================================================================
+# OPTIONAL HELPER MODULES (post-registration cleanup toolkit)
+# =============================================================================
+# The reusable cleanup helpers live in the SAME src/ folder as this file:
+#   mesh_utils, smoothing_utils, region_selection, metrics_utils, maya_io
+#
+# This script is normally loaded with exec(open(...).read()), so __file__ is not
+# defined and Python cannot auto-locate its siblings. We therefore try to find
+# the src/ folder and put it on sys.path. If that fails, the CORE registration
+# workflow (setup_target_registration / run_shrinkwrap) still works exactly as
+# before -- only the new cleanup helpers are disabled.
+#
+# If auto-detect ever fails in your setup, set HELPER_SRC_DIR to the absolute
+# path of this src/ folder before running.
+HELPER_SRC_DIR = None
+
+def _locate_helper_src_dir():
+    candidates = []
+    if HELPER_SRC_DIR:
+        candidates.append(HELPER_SRC_DIR)
+    if '__file__' in globals():
+        candidates.append(os.path.dirname(os.path.abspath(globals()['__file__'])))
+    candidates.extend(sys.path)
+    for c in candidates:
+        try:
+            if c and os.path.exists(os.path.join(c, 'smoothing_utils.py')):
+                return c
+        except Exception:
+            pass
+    return None
+
+HELPERS_AVAILABLE = False
+try:
+    import sys
+    import importlib
+    _src_dir = _locate_helper_src_dir()
+    if _src_dir and _src_dir not in sys.path:
+        sys.path.insert(0, _src_dir)
+    import mesh_utils
+    import smoothing_utils
+    import region_selection
+    import metrics_utils
+    import maya_io
+    # Reload so edits to helpers take effect on re-exec during development.
+    for _m in (mesh_utils, smoothing_utils, region_selection, metrics_utils, maya_io):
+        importlib.reload(_m)
+    HELPERS_AVAILABLE = True
+    print("[helpers] cleanup toolkit loaded from: {0}".format(_src_dir))
+except Exception as _e:
+    print("[helpers] cleanup toolkit not loaded ({0}); core workflow unaffected".format(_e))
+
+
+# =============================================================================
 # CONFIGURATION
 # =============================================================================
 
@@ -2513,3 +2565,131 @@ print(f"  set_selection_weight(0.2)          - Selected verts deform less")
 print(f"  set_preset_weight('nose_area',0.2) - Preset area deforms less")
 print(f"  show_weight_info()                 - Show weight summary")
 print("=" * 70 + "\n")
+
+
+# =============================================================================
+# POST-REGISTRATION CLEANUP ORCHESTRATION (thin wrappers over src/ helpers)
+# =============================================================================
+# These entry points are the NEW workflow for localized cleanup AFTER a normal
+# registration run. They keep d98 as the orchestrator: the real work lives in
+# the helper modules (smoothing_utils, region_selection, metrics_utils,
+# maya_io). All of them require the cleanup toolkit to be importable
+# (HELPERS_AVAILABLE); if it is not, they print a hint and do nothing.
+#
+# TYPICAL CLEANUP WORKFLOW FROM MAYA
+# ---------------------------------
+#   # 0. Send this file to Maya (VS Code Maya extension) / or:
+#   #    exec(open(r"...\src\d98-target_shrinkwrap_registration.py").read())
+#   #
+#   # 1. (Optional) run the normal registration first:
+#   #      setup_target_registration(); apply_all_contour_landmarks(); run_shrinkwrap(400)
+#   #
+#   # 2. In the viewport, right-click the skin mesh -> Vertex, and select a bad patch.
+#   # 3. Smooth ONLY that selection (volume-preserving Taubin by default):
+#          cleanup_selected_region(strength=0.3, iterations=8)
+#   #
+#   # 4. Or smooth an approximate named region without hand-selecting:
+#          cleanup_named_region('lips', strength=0.3, iterations=8, grow=1)
+#   #
+#   # 5. Save your work as a NEW scene (never overwrites an existing file):
+#          save_cleanup_scene(r"C:\path\to\t33_cleanup_from_t32.mb")
+
+def _helpers_ready():
+    if not HELPERS_AVAILABLE:
+        print("[cleanup] helper toolkit not loaded. Ensure the src/ folder is "
+              "importable (set HELPER_SRC_DIR) and re-run this script.")
+        return False
+    return True
+
+
+def cleanup_selected_region(strength=0.3, iterations=8, method="taubin",
+                            grow=0, mesh_name=None, export_csv=None):
+    """Smooth ONLY the vertices currently selected on the skin mesh.
+
+    Select a problematic patch in the Maya viewport (Vertex component mode),
+    then call this. Neighboring (unselected) vertices are used as references so
+    the smoothed patch blends into its surroundings instead of tearing.
+
+    Parameters
+    ----------
+    strength : float      blend / lambda strength per pass.
+    iterations : int      number of smoothing passes.
+    method : str          "taubin" (volume preserving) or "laplacian".
+    grow : int            grow the selection by N rings first (softer edges).
+    mesh_name : str       defaults to SKIN_MESH.
+    export_csv : str      optional path to write a per-vertex displacement CSV.
+    """
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    indices = region_selection.from_current_selection(mesh_name)
+    if not indices:
+        print("[cleanup] no vertices selected on '{0}'. Select a patch first.".format(mesh_name))
+        return
+    if grow > 0:
+        indices = region_selection.grow_region(mesh_name, indices, rings=grow)
+    return _run_region_cleanup(mesh_name, indices, strength, iterations,
+                               method, export_csv, label="selection")
+
+
+def cleanup_named_region(region, strength=0.3, iterations=8, method="taubin",
+                         grow=1, mesh_name=None, export_csv=None):
+    """Smooth an approximate named facial region (heuristic bounding box).
+
+    ``region`` is one of: 'chin', 'lips', 'nose', 'cheeks', 'eyes'. These are
+    rough starting selections -- for precise work, select by hand and use
+    :func:`cleanup_selected_region` instead.
+    """
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    indices = region_selection.named_region(mesh_name, region)
+    if not indices:
+        return
+    if grow > 0:
+        indices = region_selection.grow_region(mesh_name, indices, rings=grow)
+    return _run_region_cleanup(mesh_name, indices, strength, iterations,
+                               method, export_csv, label=region)
+
+
+def _run_region_cleanup(mesh_name, indices, strength, iterations, method,
+                        export_csv, label):
+    """Shared body: smooth a region, report displacement, keep the mesh name."""
+    before, after = smoothing_utils.smooth_mesh_region(
+        mesh_name, indices=indices, strength=strength,
+        iterations=iterations, method=method, apply=True)
+    if not before:
+        return
+    stats = metrics_utils.print_displacement_report(
+        before, after, indices=indices, label="cleanup[{0}]".format(label))
+    if export_csv:
+        metrics_utils.export_displacement_csv(before, after, export_csv, indices=indices)
+    return stats
+
+
+def backup_skin_mesh(suffix="_precleanup"):
+    """Duplicate the skin mesh as a backup before cleanup (name preserved)."""
+    if not _helpers_ready():
+        return
+    return maya_io.duplicate_mesh(SKIN_MESH, suffix=suffix)
+
+
+def save_cleanup_scene(path, force=False):
+    """Save the scene to a NEW .mb path. Refuses to overwrite unless force=True.
+
+    Use this to version cleanup work, e.g.
+        save_cleanup_scene(r"C:\\...\\t33_cleanup_from_t32.mb")
+    It will NOT overwrite t32 or any existing file unless you pass force=True.
+    """
+    if not _helpers_ready():
+        return
+    return maya_io.save_scene_as(path, force=force)
+
+
+if HELPERS_AVAILABLE:
+    print("Post-registration cleanup helpers:")
+    print("  cleanup_selected_region(strength=0.3, iterations=8)   - smooth viewport selection")
+    print("  cleanup_named_region('lips', strength=0.3)            - smooth heuristic region")
+    print("  backup_skin_mesh()                                    - duplicate skin before edits")
+    print("  save_cleanup_scene(r'...\\t33_cleanup_from_t32.mb')    - save WITHOUT overwriting")
+    print("=" * 70 + "\n")
