@@ -56,7 +56,6 @@ Time Editor/
 # Large model / asset folders (require approval before committing)
 # =============================================================================
 models/
-assets/
 sourceimages/
 textures/
 
