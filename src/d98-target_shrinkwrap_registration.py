@@ -73,8 +73,11 @@ HELPER_SRC_DIR = r"/Users/florykhan/Documents/Projects/Research Projects/skin-to
 # Verbose diagnostics for the bootstrap (set False once it works if you like).
 HELPER_DEBUG = True
 
+# Order matters: modules that import siblings must come AFTER them. In
+# particular artifact_detection imports mesh_utils + region_selection, so it is
+# loaded last.
 HELPER_MODULES = ("mesh_utils", "smoothing_utils", "region_selection",
-                  "metrics_utils", "maya_io")
+                  "metrics_utils", "maya_io", "artifact_detection")
 HELPERS_AVAILABLE = False
 
 # Placeholders so these names always exist (reassigned to real modules on load).
@@ -83,6 +86,7 @@ smoothing_utils = None
 region_selection = None
 metrics_utils = None
 maya_io = None
+artifact_detection = None
 
 
 def _dir_has_helpers(d):
@@ -2774,6 +2778,23 @@ def _run_region_cleanup(mesh_name, indices, strength, iterations, method,
     return stats
 
 
+def detect_skin_artifacts(mesh_name=None, method="percentile", threshold=2.5,
+                          percentile=97.5, rings=1, select=True, min_score=0.0):
+    """Auto-detect locally irregular skin vertices (detection ONLY, no edits).
+
+    Thin wrapper over artifact_detection.detect_irregular_region. Flags spikes /
+    dents / folds using the umbrella-Laplacian irregularity score, optionally
+    grows the set, and selects it in the viewport for inspection. Returns
+    ``(indices, score_stats)``. Does NOT move vertices or rename objects.
+    """
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    return artifact_detection.detect_irregular_region(
+        mesh_name, method=method, threshold=threshold, percentile=percentile,
+        rings=rings, select=select, min_score=min_score)
+
+
 def backup_skin_mesh(suffix="_precleanup"):
     """Duplicate the skin mesh as a backup before cleanup (name preserved)."""
     if not _helpers_ready():
@@ -2795,6 +2816,7 @@ def save_cleanup_scene(path, force=False):
 
 if HELPERS_AVAILABLE:
     print("Post-registration cleanup helpers:")
+    print("  detect_skin_artifacts(percentile=97.5)                - AUTO-detect irregular verts (no edits)")
     print("  cleanup_selected_region(strength=0.3, iterations=8)   - smooth viewport selection")
     print("  cleanup_named_region('lips', strength=0.3)            - smooth heuristic region")
     print("  backup_skin_mesh()                                    - duplicate skin before edits")
