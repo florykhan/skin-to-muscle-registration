@@ -31,6 +31,7 @@ from typing import List, Dict, Tuple, Optional, Set
 import math
 import time
 import os
+import sys
 import json
 
 try:
@@ -49,50 +50,156 @@ except ImportError:
 # The reusable cleanup helpers live in the SAME src/ folder as this file:
 #   mesh_utils, smoothing_utils, region_selection, metrics_utils, maya_io
 #
-# This script is normally loaded with exec(open(...).read()), so __file__ is not
-# defined and Python cannot auto-locate its siblings. We therefore try to find
-# the src/ folder and put it on sys.path. If that fails, the CORE registration
-# workflow (setup_target_registration / run_shrinkwrap) still works exactly as
-# before -- only the new cleanup helpers are disabled.
+# IMPORTANT (why auto-detect from __file__ does NOT work):
+# The MayaCode VS Code extension does not run this file in place. It copies the
+# editor text into a TEMP file (e.g. <tmp>/MayaCode.py) and runs
+#   python("execfile('<tmp>/MayaCode.py')")
+# So when this code executes, __file__ is either undefined or points at the temp
+# folder -- the real src/ path is gone and the helper .py files are not there.
+# The same is true for exec(open(...).read()) (no __file__ at all).
 #
-# If auto-detect ever fails in your setup, set HELPER_SRC_DIR to the absolute
-# path of this src/ folder before running.
-HELPER_SRC_DIR = None
+# THE FIX: tell d98 where src/ is, ONCE, using either of these (checked in order):
+#   1) Set the SMR_SRC_DIR environment variable (e.g. in Maya's userSetup.py) --
+#      best for a machine-wide, file-independent setup.
+#   2) Set HELPER_SRC_DIR below -- travels with this file, so you still only ever
+#      send d98 to Maya (never the helper files).
+# After that, only sending d98 is required; helpers import/reload from disk.
+#
+# Set this to your src/ folder. It is set below to this repo's src/ on this Mac.
+# If you run Maya on a different machine, change it to that machine's src/ path,
+# e.g. r"C:\keyLabLocal_D\skin-muscle-registration-model\src".
+HELPER_SRC_DIR = r"/Users/florykhan/Documents/Projects/Research Projects/skin-to-muscle-registration/src"
 
-def _locate_helper_src_dir():
-    candidates = []
+# Verbose diagnostics for the bootstrap (set False once it works if you like).
+HELPER_DEBUG = True
+
+HELPER_MODULES = ("mesh_utils", "smoothing_utils", "region_selection",
+                  "metrics_utils", "maya_io")
+HELPERS_AVAILABLE = False
+
+# Placeholders so these names always exist (reassigned to real modules on load).
+mesh_utils = None
+smoothing_utils = None
+region_selection = None
+metrics_utils = None
+maya_io = None
+
+
+def _dir_has_helpers(d):
+    """True only if EVERY helper module .py file exists in directory ``d``."""
+    try:
+        return bool(d) and all(
+            os.path.exists(os.path.join(d, name + ".py")) for name in HELPER_MODULES)
+    except Exception:
+        return False
+
+
+def _candidate_src_dirs():
+    """Ordered list of directories that might contain the helper modules."""
+    cands = []
+    # 1) explicit constant
     if HELPER_SRC_DIR:
-        candidates.append(HELPER_SRC_DIR)
-    if '__file__' in globals():
-        candidates.append(os.path.dirname(os.path.abspath(globals()['__file__'])))
-    candidates.extend(sys.path)
-    for c in candidates:
+        cands.append(HELPER_SRC_DIR)
+    # 2) environment variable
+    env = os.environ.get("SMR_SRC_DIR")
+    if env:
+        cands.append(env)
+    # 3) __file__ (only helps for execfile-style senders that set it to a real path)
+    if "__file__" in globals():
         try:
-            if c and os.path.exists(os.path.join(c, 'smoothing_utils.py')):
-                return c
+            cands.append(os.path.dirname(os.path.abspath(globals()["__file__"])))
         except Exception:
             pass
+    # 4) the running frame's code filename (helps if compiled with a real path)
+    try:
+        fn = sys._getframe().f_code.co_filename
+        if fn and os.path.exists(fn):
+            cands.append(os.path.dirname(os.path.abspath(fn)))
+    except Exception:
+        pass
+    # 5) anything already on sys.path, plus the current working directory
+    cands.extend(sys.path)
+    try:
+        cands.append(os.getcwd())
+    except Exception:
+        pass
+    return cands
+
+
+def _locate_helper_src_dir():
+    for d in _candidate_src_dirs():
+        if _dir_has_helpers(d):
+            return d
     return None
 
-HELPERS_AVAILABLE = False
-try:
-    import sys
+
+def _load_cleanup_helpers(verbose=None):
+    """Locate src/, import/reload the helper modules, and report precisely.
+
+    Returns True on success. On failure it prints a full traceback and the exact
+    module that failed, plus the resolved path and sys.path, so the reason is
+    never hidden by a broad except. The core registration workflow does not
+    depend on this succeeding.
+    """
+    global HELPERS_AVAILABLE
     import importlib
-    _src_dir = _locate_helper_src_dir()
-    if _src_dir and _src_dir not in sys.path:
-        sys.path.insert(0, _src_dir)
-    import mesh_utils
-    import smoothing_utils
-    import region_selection
-    import metrics_utils
-    import maya_io
-    # Reload so edits to helpers take effect on re-exec during development.
-    for _m in (mesh_utils, smoothing_utils, region_selection, metrics_utils, maya_io):
-        importlib.reload(_m)
+    import traceback
+
+    if verbose is None:
+        verbose = HELPER_DEBUG
+
+    src = _locate_helper_src_dir()
+
+    if verbose:
+        print("[helpers] resolving cleanup toolkit ...")
+        print("  HELPER_SRC_DIR       = {0!r}".format(HELPER_SRC_DIR))
+        print("  SMR_SRC_DIR (env)    = {0!r}".format(os.environ.get("SMR_SRC_DIR")))
+        print("  __file__ defined?    = {0}".format("__file__" in globals()))
+        print("  co_filename          = {0!r}".format(sys._getframe().f_code.co_filename))
+        print("  resolved src dir     = {0!r}".format(src))
+        print("  resolved dir exists? = {0}".format(bool(src) and os.path.isdir(src)))
+
+    if not src:
+        HELPERS_AVAILABLE = False
+        print("[helpers] Could NOT locate the src/ folder containing: {0}".format(
+            ", ".join(m + ".py" for m in HELPER_MODULES)))
+        print("          MayaCode runs this file from a temp copy, so the real path")
+        print("          is unknown. Set HELPER_SRC_DIR (top of this file) or the")
+        print("          SMR_SRC_DIR environment variable to your src/ folder, then")
+        print("          re-send d98. Example:")
+        print("            HELPER_SRC_DIR = r\"C:\\path\\to\\skin-to-muscle-registration\\src\"")
+        print("  sys.path (first 10 entries):")
+        for p in sys.path[:10]:
+            print("     {0}".format(p))
+        return False
+
+    if src not in sys.path:
+        sys.path.insert(0, src)
+
+    for name in HELPER_MODULES:
+        try:
+            if name in sys.modules:
+                # Reload so edits to helpers take effect when you re-send d98.
+                importlib.reload(sys.modules[name])
+            else:
+                importlib.import_module(name)
+            # Expose the module as a top-level name so the orchestrator wrappers
+            # (cleanup_selected_region, etc.) can call e.g. smoothing_utils.*.
+            globals()[name] = sys.modules[name]
+        except Exception:
+            HELPERS_AVAILABLE = False
+            print("[helpers] FAILED to import helper module '{0}' from {1}".format(name, src))
+            print("[helpers] --- full traceback ---")
+            traceback.print_exc()
+            print("[helpers] ----------------------")
+            return False
+
     HELPERS_AVAILABLE = True
-    print("[helpers] cleanup toolkit loaded from: {0}".format(_src_dir))
-except Exception as _e:
-    print("[helpers] cleanup toolkit not loaded ({0}); core workflow unaffected".format(_e))
+    print("[helpers] cleanup toolkit loaded from: {0}".format(src))
+    return True
+
+
+_load_cleanup_helpers()
 
 
 # =============================================================================
