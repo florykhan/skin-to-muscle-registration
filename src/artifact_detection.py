@@ -317,3 +317,255 @@ def detect_irregular_region(mesh_name: str,
               "(mesh unchanged)".format(len(grown)))
 
     return grown, stats
+
+
+# =============================================================================
+# M2. REFERENCE-BASED LAPLACIAN COMPARISON
+# =============================================================================
+# WHY M2 REDUCES FALSE POSITIVES (vs. the M1 magnitude score)
+# -----------------------------------------------------------
+# M1 flags a vertex when its own umbrella Laplacian is large:
+#       score_i = ||x_i - mean(x_j for j in N(i))||
+# That quantity is essentially discrete local curvature, so it is intrinsically
+# large wherever the FACE is genuinely curved -- nostrils, lip border, eyelid
+# creases, brow, jawline -- even when those areas are registered perfectly. M1
+# therefore cannot tell "sharp because it's an artifact" from "sharp because the
+# anatomy is sharp," and drowns real artifacts in valid high-curvature features.
+#
+# M2 instead compares the CURRENT skin's local shape against a REFERENCE (the
+# target mesh) that shares topology and vertex correspondence:
+#       L_current(i) = x_i - mean(x_j for j in N(i))     # local shape, current
+#       L_target(i)  = t_i - mean(t_j for j in N(i))     # local shape, target
+#       score_i      = ||L_current(i) - L_target(i)||    # DISAGREEMENT in shape
+# Comparing the full Laplacian VECTORS (not just magnitudes) means a valid
+# feature that is present in BOTH meshes largely cancels: L_current ~= L_target,
+# so its score is small. What survives is where the current mesh's local shape
+# DEVIATES from the reference -- i.e. spikes/dents/folds introduced by
+# registration -- which is exactly what we want to flag. High but faithful
+# curvature is suppressed; genuine local disagreement is preserved.
+#
+# The optional normalization divides by the current mesh's average local edge
+# length so the score becomes scale-relative (a small absolute wobble in a dense
+# region counts comparably to the same relative wobble in a coarse region).
+
+def validate_corresponding_topology(current_mesh: str,
+                                    target_mesh: str,
+                                    check_adjacency: bool = True,
+                                    ) -> Dict[str, object]:
+    """Verify two meshes share topology / vertex correspondence for M2.
+
+    Checks (in order): both objects exist, both non-empty, equal vertex counts,
+    and -- when ``check_adjacency`` is True -- identical 1-ring adjacency for
+    every vertex (so index ``i`` refers to the same point on both meshes).
+
+    Parameters
+    ----------
+    current_mesh, target_mesh:
+        Meshes to compare. Neither is modified.
+    check_adjacency:
+        If True (default) compare per-vertex neighbour sets. This is O(V*d) and
+        the strongest available correspondence guarantee short of UVs/IDs.
+
+    Returns
+    -------
+    dict
+        ``{"ok": True, "vertex_count": int, "adjacency_checked": bool,
+           "adjacency_match": bool}`` on success.
+
+    Raises
+    ------
+    ValueError
+        With a descriptive message if any check fails.
+    """
+    for m in (current_mesh, target_mesh):
+        if not mesh_utils.mesh_exists(m):
+            raise ValueError("mesh '{0}' does not exist".format(m))
+
+    nc = mesh_utils.get_vertex_count(current_mesh)
+    nt = mesh_utils.get_vertex_count(target_mesh)
+    if nc == 0 or nt == 0:
+        raise ValueError("empty mesh: '{0}' has {1} verts, '{2}' has {3} verts".format(
+            current_mesh, nc, target_mesh, nt))
+    if nc != nt:
+        raise ValueError(
+            "vertex count mismatch: '{0}'={1} vs '{2}'={3}; meshes are not "
+            "corresponding".format(current_mesh, nc, target_mesh, nt))
+
+    adjacency_match = True
+    if check_adjacency:
+        na = mesh_utils.get_vertex_neighbors(current_mesh)
+        nb = mesh_utils.get_vertex_neighbors(target_mesh)
+        if len(na) != len(nb):
+            raise ValueError("adjacency length mismatch ({0} vs {1})".format(
+                len(na), len(nb)))
+        for i in range(len(na)):
+            if set(na[i]) != set(nb[i]):
+                adjacency_match = False
+                raise ValueError(
+                    "adjacency mismatch at vertex {0}: meshes do not share "
+                    "topology / correspondence".format(i))
+
+    return {"ok": True, "vertex_count": nc,
+            "adjacency_checked": bool(check_adjacency),
+            "adjacency_match": adjacency_match}
+
+
+def compute_reference_laplacian_scores(current_mesh: str,
+                                       target_mesh: str,
+                                       indices: Optional[List[int]] = None,
+                                       normalize: bool = False,
+                                       epsilon: float = 1e-8,
+                                       ) -> Dict[int, float]:
+    """Score vertices by disagreement between current and target local shape.
+
+    For each vertex ``i`` (using the shared 1-ring ``N(i)``)::
+
+        L_current(i) = x_i - mean(x_j for j in N(i))
+        L_target(i)  = t_i - mean(t_j for j in N(i))
+        score_i      = || L_current(i) - L_target(i) ||
+
+    If ``normalize`` is True the score is divided by the current mesh's local
+    scale ``mean(||x_i - x_j|| for j in N(i)) + epsilon`` to make it
+    scale-relative. See the module section header for why this reduces the
+    false positives seen with the M1 magnitude score.
+
+    Parameters
+    ----------
+    current_mesh, target_mesh:
+        Corresponding meshes (identical topology / vertex order). Not modified.
+    indices:
+        If given, score only these vertex indices (neighbours are still read
+        from the full meshes, so scores are exact).
+    normalize:
+        Divide by current-mesh average local edge length when True.
+    epsilon:
+        Small constant guarding the normalization denominator (default 1e-8).
+
+    Returns
+    -------
+    dict
+        ``{vertex_index: score}``. Empty if either mesh is missing/empty or the
+        vertex counts differ. No-neighbour (boundary) vertices score ``0.0``.
+
+    Notes
+    -----
+    Each mesh's positions are read once and the (shared) topology is read once;
+    the target's Laplacian is evaluated over the same neighbour indices, which is
+    valid precisely because the meshes correspond (validate this up front with
+    :func:`validate_corresponding_topology`).
+    """
+    current = mesh_utils.get_mesh_vertices(current_mesh)
+    target = mesh_utils.get_mesh_vertices(target_mesh)
+    if not current or not target:
+        print("[artifact_detection][M2] missing/empty mesh "
+              "('{0}': {1}, '{2}': {3})".format(
+                  current_mesh, len(current), target_mesh, len(target)))
+        return {}
+    if len(current) != len(target):
+        print("[artifact_detection][M2] vertex count mismatch "
+              "({0} vs {1}); meshes are not corresponding".format(
+                  len(current), len(target)))
+        return {}
+
+    neighbors = mesh_utils.get_vertex_neighbors(current_mesh)
+    if not neighbors:
+        print("[artifact_detection][M2] could not read topology for "
+              "'{0}'".format(current_mesh))
+        return {}
+
+    n = len(current)
+    if indices is None:
+        target_indices: List[int] = list(range(n))
+    else:
+        target_indices = [i for i in indices if 0 <= i < n]
+
+    scores: Dict[int, float] = {}
+    for i in target_indices:
+        nbrs = neighbors[i]
+        if not nbrs:
+            scores[i] = 0.0
+            continue
+        cen_cur = mesh_utils.vec_mean([current[j] for j in nbrs])
+        cen_tgt = mesh_utils.vec_mean([target[j] for j in nbrs])
+        lap_cur = mesh_utils.vec_sub(current[i], cen_cur)
+        lap_tgt = mesh_utils.vec_sub(target[i], cen_tgt)
+        diff = mesh_utils.vec_sub(lap_cur, lap_tgt)
+        score = mesh_utils.vec_length(diff)
+
+        if normalize:
+            local_scale = sum(
+                mesh_utils.vec_length(mesh_utils.vec_sub(current[i], current[j]))
+                for j in nbrs) / len(nbrs)
+            score = score / (local_scale + epsilon)
+
+        scores[i] = score
+    return scores
+
+
+def detect_reference_irregular_region(current_mesh: str,
+                                      target_mesh: str,
+                                      method: str = "percentile",
+                                      threshold: float = 2.5,
+                                      percentile: float = 97.5,
+                                      min_score: float = 0.0,
+                                      normalize: bool = True,
+                                      rings: int = 1,
+                                      select: bool = True,
+                                      epsilon: float = 1e-8,
+                                      ) -> Tuple[List[int], Dict[str, float]]:
+    """M2 end-to-end: reference-Laplacian scoring -> detection -> selection.
+
+    Validates correspondence, scores by current-vs-target local shape
+    disagreement, flags outliers, grows by ``rings``, and (optionally) selects
+    the result in Maya. Reuses :func:`summarize_scores`, :func:`detect_outliers`,
+    :func:`grow_detected_region`, and :func:`select_vertices`.
+
+    **Detection only -- no vertex positions are ever changed.**
+
+    Returns
+    -------
+    (indices, stats):
+        Final (possibly grown) suspicious vertex indices and the score summary.
+        Returns ``([], empty_stats)`` if the topology check fails or no scores
+        can be computed (fails gracefully instead of raising inside Maya).
+    """
+    try:
+        info = validate_corresponding_topology(current_mesh, target_mesh)
+    except ValueError as exc:
+        print("[artifact_detection][M2] topology check FAILED: {0}".format(exc))
+        return [], summarize_scores({})
+    print("[artifact_detection][M2] topology OK ({0} verts, adjacency {1})".format(
+        info["vertex_count"],
+        "checked" if info["adjacency_checked"] else "skipped"))
+
+    scores = compute_reference_laplacian_scores(
+        current_mesh, target_mesh, normalize=normalize, epsilon=epsilon)
+    stats = summarize_scores(scores)
+    if stats["count"] == 0:
+        print("[artifact_detection][M2] no scores computed")
+        return [], stats
+
+    detected = detect_outliers(scores, method=method, threshold=threshold,
+                               percentile=percentile, min_score=min_score)
+    grown = grow_detected_region(current_mesh, detected, rings=rings)
+
+    if method == "zscore":
+        crit = "z-score >= {0}".format(threshold)
+    else:
+        crit = "top {0:.1f}%% (percentile >= {1})".format(100.0 - percentile, percentile)
+    norm_note = "normalized" if normalize else "absolute"
+
+    print("[artifact_detection][M2] '{0}' vs '{1}' ({2}): scored {3} verts | "
+          "mean={4:.4f} median={5:.4f} std={6:.4f} max={7:.4f} (vtx {8})".format(
+              current_mesh, target_mesh, norm_note, stats["count"],
+              stats["mean"], stats["median"], stats["std"],
+              stats["max"], stats["max_index"]))
+    print("[artifact_detection][M2] flagged {0} by {1}; grown to {2} verts "
+          "(+{3} ring(s))".format(len(detected), crit, len(grown), rings))
+
+    if select and grown:
+        select_vertices(current_mesh, grown)
+        print("[artifact_detection][M2] selected {0} vertices for inspection "
+              "(mesh unchanged)".format(len(grown)))
+
+    return grown, stats

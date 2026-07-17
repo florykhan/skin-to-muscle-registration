@@ -2795,6 +2795,29 @@ def detect_skin_artifacts(mesh_name=None, method="percentile", threshold=2.5,
         rings=rings, select=select, min_score=min_score)
 
 
+def detect_reference_skin_artifacts(current_mesh=None, target_mesh=None,
+                                    method="percentile", threshold=2.5,
+                                    percentile=97.5, min_score=0.0,
+                                    normalize=True, rings=1, select=True,
+                                    epsilon=1e-8):
+    """M2 detector: reference-based Laplacian comparison (detection ONLY).
+
+    Compares the current skin's local shape against the target mesh so valid
+    high-curvature anatomy (nose, lips, eyelids, brow, jaw) cancels out and only
+    genuine local disagreement (registration artifacts) is flagged. Selects the
+    result for inspection. Returns ``(indices, score_stats)``. Never edits or
+    renames meshes.
+    """
+    if not _helpers_ready():
+        return
+    current_mesh = current_mesh or SKIN_MESH
+    target_mesh = target_mesh or TARGET_MESH
+    return artifact_detection.detect_reference_irregular_region(
+        current_mesh, target_mesh, method=method, threshold=threshold,
+        percentile=percentile, min_score=min_score, normalize=normalize,
+        rings=rings, select=select, epsilon=epsilon)
+
+
 def backup_skin_mesh(suffix="_precleanup"):
     """Duplicate the skin mesh as a backup before cleanup (name preserved)."""
     if not _helpers_ready():
@@ -2816,7 +2839,8 @@ def save_cleanup_scene(path, force=False):
 
 if HELPERS_AVAILABLE:
     print("Post-registration cleanup helpers:")
-    print("  detect_skin_artifacts(percentile=97.5)                - AUTO-detect irregular verts (no edits)")
+    print("  detect_skin_artifacts(percentile=97.5)                - M1 AUTO-detect irregular verts (no edits)")
+    print("  detect_reference_skin_artifacts(percentile=97.5)      - M2 reference-based detect (fewer false +)")
     print("  cleanup_selected_region(strength=0.3, iterations=8)   - smooth viewport selection")
     print("  cleanup_named_region('lips', strength=0.3)            - smooth heuristic region")
     print("  backup_skin_mesh()                                    - duplicate skin before edits")
