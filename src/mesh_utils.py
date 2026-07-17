@@ -141,6 +141,30 @@ def get_vertex_neighbors(mesh_name):
     return [list(s) for s in neighbors]
 
 
+def get_boundary_vertices(mesh_name):
+    """Return the set of true topological boundary vertex indices.
+
+    A boundary edge is a mesh edge that borders exactly one face (an open border
+    of the surface); its two endpoints are boundary vertices. This is a purely
+    topological test via ``MItMeshEdge.onBoundary()`` -- it does NOT use vertex
+    positions or any anatomical assumption. Returns an empty set outside Maya or
+    for a closed mesh with no open borders.
+    """
+    if not MAYA_AVAILABLE:
+        return set()
+    mesh_fn = get_mesh_fn(mesh_name)
+    if mesh_fn is None:
+        return set()
+    boundary = set()
+    edge_iter = om.MItMeshEdge(mesh_fn.object())
+    while not edge_iter.isDone():
+        if edge_iter.onBoundary():
+            boundary.add(edge_iter.vertexId(0))
+            boundary.add(edge_iter.vertexId(1))
+        edge_iter.next()
+    return boundary
+
+
 # =============================================================================
 # SELECTION / COMPONENT HELPERS
 # =============================================================================

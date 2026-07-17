@@ -2795,6 +2795,37 @@ def detect_skin_artifacts(mesh_name=None, method="percentile", threshold=2.5,
         rings=rings, select=select, min_score=min_score)
 
 
+def detect_multiscale_skin_artifacts(mesh_name=None, scales=(1, 2, 3),
+                                     method="percentile", percentile=97.5,
+                                     threshold=2.5, normalize=True,
+                                     aggregation="persistence",
+                                     min_persistent_scales=2,
+                                     exclude_boundaries=True,
+                                     boundary_buffer_rings=1,
+                                     min_component_size=5,
+                                     final_growth_rings=1, select=True,
+                                     epsilon=1e-8):
+    """M3 (experimental) multi-scale, boundary-aware artifact detection.
+
+    Thin delegate to artifact_detection.detect_multiscale_irregular_region.
+    Enhances M1 by combining Laplacian scores across neighbourhood scales,
+    excluding true topological boundaries, and dropping tiny components.
+    Detection ONLY -- never moves vertices or renames objects. Returns
+    ``(final_indices, report)``.
+    """
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    return artifact_detection.detect_multiscale_irregular_region(
+        mesh_name, scales=scales, method=method, percentile=percentile,
+        threshold=threshold, normalize=normalize, aggregation=aggregation,
+        min_persistent_scales=min_persistent_scales,
+        exclude_boundaries=exclude_boundaries,
+        boundary_buffer_rings=boundary_buffer_rings,
+        min_component_size=min_component_size,
+        final_growth_rings=final_growth_rings, select=select, epsilon=epsilon)
+
+
 def backup_skin_mesh(suffix="_precleanup"):
     """Duplicate the skin mesh as a backup before cleanup (name preserved)."""
     if not _helpers_ready():
@@ -2816,7 +2847,8 @@ def save_cleanup_scene(path, force=False):
 
 if HELPERS_AVAILABLE:
     print("Post-registration cleanup helpers:")
-    print("  detect_skin_artifacts(percentile=97.5)                - AUTO-detect irregular verts (no edits)")
+    print("  detect_skin_artifacts(percentile=97.5)                - M1 AUTO-detect irregular verts (no edits)")
+    print("  detect_multiscale_skin_artifacts()                    - M3 multi-scale boundary-aware detect (exp.)")
     print("  cleanup_selected_region(strength=0.3, iterations=8)   - smooth viewport selection")
     print("  cleanup_named_region('lips', strength=0.3)            - smooth heuristic region")
     print("  backup_skin_mesh()                                    - duplicate skin before edits")
