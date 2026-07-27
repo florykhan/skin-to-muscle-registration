@@ -843,3 +843,534 @@ def detect_multiscale_irregular_region(mesh_name: str,
               "(mesh unchanged)".format(len(final_indices)))
 
     return final_indices, report
+
+
+# =============================================================================
+# M3 V2 - Hybrid Geometry and Anatomy-Aware Artifact Detection
+# =============================================================================
+# EXPERIMENTAL. Enhances (does not replace) M1 and M3 V1, which remain untouched
+# and reproducible. Does NOT use the target mesh.
+#
+# Motivation
+# ----------
+# M3 V1 relies on the umbrella Laplacian, which measures LOCAL geometric
+# irregularity. Visual evaluation showed it catches sharp local defects (e.g. a
+# chin spike) but misses BROAD, smooth registration errors (e.g. cheeks that
+# drifted off the anatomy but stayed locally smooth), and still lights up
+# edge-like regions. Parameter tuning alone cannot fix this because the missed
+# errors genuinely have low Laplacian scores.
+#
+# M3 V2 combines three complementary signals so different error types can be
+# caught by whichever signal is sensitive to them:
+#   1. Multi-scale Laplacian irregularity  -> local spikes/dents/folds (reuses V1).
+#   2. Surface-normal inconsistency        -> creased / flipped / noisy shading.
+#   3. Local deviation in distance-to-anatomy -> broad drift off the underlying
+#      internal meshes even where the surface is locally smooth (the class of
+#      error the Laplacian misses).
+# Each signal is robustly normalized (median / MAD) so a global threshold is
+# comparable across signals, then combined with configurable weights. Instead of
+# hard boundary deletion (V1), a SOFT boundary weight down-scales scores near
+# open borders, so edge noise is suppressed without discarding valid nearby
+# artifacts.
+#
+# This is a hypothesis to evaluate visually; no accuracy claim is made. Like all
+# earlier methods it is detection-only and never edits geometry.
+
+
+def _mad(values: List[float], med: float) -> float:
+    """Median absolute deviation about ``med`` (0.0 for empty input)."""
+    if not values:
+        return 0.0
+    return _median([abs(v - med) for v in values])
+
+
+def robust_normalize_scores(scores: Dict[int, float],
+                            epsilon: float = 1e-8,
+                            clamp_negative: bool = True,
+                            ) -> Dict[int, float]:
+    """Robustly normalize a score map using median / MAD.
+
+        robust_z_i = (score_i - median(score)) / (1.4826 * MAD + epsilon)
+
+    The ``1.4826`` factor makes MAD a consistent estimator of the standard
+    deviation for normal data, so the result is a robust analogue of a z-score
+    that resists outliers dominating the scale. Negative values (below the
+    median) are clamped to 0 by default, since only high scores indicate
+    candidate artifacts.
+    """
+    if not scores:
+        return {}
+    values = list(scores.values())
+    med = _median(values)
+    denom = 1.4826 * _mad(values, med) + epsilon
+    out: Dict[int, float] = {}
+    for i, v in scores.items():
+        z = (v - med) / denom
+        if clamp_negative and z < 0.0:
+            z = 0.0
+        out[i] = z
+    return out
+
+
+def compute_normal_inconsistency_scores(mesh_name: str,
+                                        normal_rings: int = 1,
+                                        adjacency: Optional[List[List[int]]] = None,
+                                        normals: Optional[List[List[float]]] = None,
+                                        ) -> Dict[int, float]:
+    """Score vertices by how much neighbouring surface normals disagree.
+
+        normal_score_i = 1 - mean(clamp(dot(n_i, n_j), -1, 1) for j in N_r(i))
+
+    High where the local surface direction varies (creases, folds, flipped or
+    noisy normals); ~0 on a smooth patch where neighbours point the same way.
+    Vertex normals and adjacency are each read once.
+
+    Raises
+    ------
+    ValueError
+        If ``normal_rings < 1``.
+    """
+    if normal_rings < 1:
+        raise ValueError("normal_rings must be >= 1, got {0}".format(normal_rings))
+    if adjacency is None:
+        adjacency = mesh_utils.get_vertex_neighbors(mesh_name)
+    if normals is None:
+        normals = mesh_utils.get_vertex_normals(mesh_name)
+    if not normals or not adjacency:
+        print("[artifact_detection][M3V2] no normals/topology for '{0}'".format(mesh_name))
+        return {}
+
+    n = min(len(normals), len(adjacency))
+    scores: Dict[int, float] = {}
+    for i in range(n):
+        if not adjacency[i]:
+            scores[i] = 0.0
+            continue
+        members = _ring_layers(adjacency, i, normal_rings).get(normal_rings, set())
+        if not members:
+            scores[i] = 0.0
+            continue
+        ni = normals[i]
+        acc = 0.0
+        for j in members:
+            nj = normals[j]
+            dot = ni[0] * nj[0] + ni[1] * nj[1] + ni[2] * nj[2]
+            if dot > 1.0:
+                dot = 1.0
+            elif dot < -1.0:
+                dot = -1.0
+            acc += dot
+        scores[i] = 1.0 - (acc / len(members))
+    return scores
+
+
+def compute_distance_to_anatomy_scores(skin_mesh: str,
+                                       anatomical_meshes: Sequence[str],
+                                       distance_rings: int = 2,
+                                       robust: bool = True,
+                                       adjacency: Optional[List[List[int]]] = None,
+                                       epsilon: float = 1e-8,
+                                       ) -> Dict[str, object]:
+    """Score vertices by local deviation of their distance to the anatomy.
+
+    For each skin vertex ``i`` let ``d_i`` be the shortest distance to the union
+    of valid internal meshes. The local (robust) deviation is::
+
+        distance_score_i = |d_i - median(d_j for j in N_r(i))|            # robust=False
+        distance_score_i = |d_i - local_median| / (local_MAD + epsilon)   # robust=True (default)
+
+    A vertex that sits much closer/farther from the anatomy than its neighbours
+    is flagged -- this catches BROAD drift off the underlying structures even
+    where the surface is locally smooth (which the Laplacian misses). Closest
+    distances use one cached ``MMeshIntersector`` per anatomical mesh (see
+    :func:`mesh_utils.compute_closest_point_distances`).
+
+    Returns
+    -------
+    dict
+        ``{"distance_scores": {i: s}, "raw_distances": {i: d},
+           "nearest_anatomy": {i: mesh}, "valid_meshes": [...],
+           "missing_meshes": [...]}``.
+
+    Raises
+    ------
+    ValueError
+        If ``anatomical_meshes`` is empty or ``distance_rings < 1``.
+    """
+    if not anatomical_meshes:
+        raise ValueError("anatomical_meshes must be a non-empty list of mesh names")
+    if distance_rings < 1:
+        raise ValueError("distance_rings must be >= 1, got {0}".format(distance_rings))
+
+    points = mesh_utils.get_mesh_vertices(skin_mesh)
+    empty = {"distance_scores": {}, "raw_distances": {}, "nearest_anatomy": {},
+             "valid_meshes": [], "missing_meshes": list(anatomical_meshes)}
+    if not points:
+        print("[artifact_detection][M3V2] skin mesh '{0}' empty/missing".format(skin_mesh))
+        return empty
+    if adjacency is None:
+        adjacency = mesh_utils.get_vertex_neighbors(skin_mesh)
+
+    dist_res = mesh_utils.compute_closest_point_distances(points, list(anatomical_meshes))
+    raw = dist_res["distances"]
+    nearest = dist_res["nearest"]
+
+    v = len(points)
+    raw_distances = {i: raw[i] for i in range(v)}
+    nearest_anatomy = {i: nearest[i] for i in range(v)}
+    distance_scores: Dict[int, float] = {}
+    for i in range(v):
+        members = _ring_layers(adjacency, i, distance_rings).get(distance_rings, set())
+        if not members:
+            distance_scores[i] = 0.0
+            continue
+        local = [raw[j] for j in members]
+        local_median = _median(local)
+        dev = abs(raw[i] - local_median)
+        if robust:
+            local_mad = _median([abs(x - local_median) for x in local])
+            distance_scores[i] = dev / (local_mad + epsilon)
+        else:
+            distance_scores[i] = dev
+
+    return {"distance_scores": distance_scores, "raw_distances": raw_distances,
+            "nearest_anatomy": nearest_anatomy,
+            "valid_meshes": dist_res["valid_meshes"],
+            "missing_meshes": dist_res["missing_meshes"]}
+
+
+def compute_hybrid_artifact_scores(skin_mesh: str,
+                                   anatomical_meshes: Optional[Sequence[str]] = None,
+                                   laplacian_scales: Sequence[int] = (1, 2),
+                                   normal_rings: int = 1,
+                                   distance_rings: int = 2,
+                                   laplacian_weight: float = 0.3,
+                                   normal_weight: float = 0.2,
+                                   distance_weight: float = 0.5,
+                                   normalize_laplacian: bool = True,
+                                   epsilon: float = 1e-8,
+                                   ) -> Dict[str, object]:
+    """Combine Laplacian, normal, and distance signals into one hybrid score.
+
+        combined_i = w_lap * rz(laplacian_i)
+                   + w_normal * rz(normal_i)
+                   + w_distance * rz(distance_i)
+
+    where ``rz`` is :func:`robust_normalize_scores`. Weights must be
+    non-negative with a positive total and are normalized internally to sum to
+    1. The distance signal is skipped (all zeros) when ``distance_weight == 0``
+    so weight-free ablations stay fast and need no anatomy.
+
+    Returns a dict with ``combined_scores``, the three per-signal score maps,
+    ``raw_distances``, ``nearest_anatomy``, normalized ``weights``, valid/missing
+    anatomy lists, and ``statistics`` (per-signal + combined summaries).
+
+    Raises
+    ------
+    ValueError
+        On negative weights, non-positive total weight, or if the distance
+        signal is requested (``distance_weight > 0``) without anatomical meshes.
+    """
+    weights_in = [laplacian_weight, normal_weight, distance_weight]
+    if any(w < 0 for w in weights_in):
+        raise ValueError("weights must be non-negative, got {0}".format(weights_in))
+    total = sum(weights_in)
+    if total <= 0:
+        raise ValueError("weights must have a positive total, got {0}".format(weights_in))
+    w_lap, w_normal, w_distance = (w / total for w in weights_in)
+
+    adjacency = mesh_utils.get_vertex_neighbors(skin_mesh)
+    if not adjacency:
+        print("[artifact_detection][M3V2] could not read topology for '{0}'".format(skin_mesh))
+        return {"combined_scores": {}, "laplacian_scores": {}, "normal_scores": {},
+                "distance_scores": {}, "raw_distances": {}, "nearest_anatomy": {},
+                "weights": {"laplacian": w_lap, "normal": w_normal, "distance": w_distance},
+                "statistics": {}, "valid_meshes": [], "missing_meshes": []}
+    v = len(adjacency)
+
+    # 1. multi-scale Laplacian (reuse V1), combined across scales by mean
+    lap = compute_multiscale_laplacian_scores(
+        skin_mesh, scales=laplacian_scales, normalize=normalize_laplacian,
+        epsilon=epsilon, aggregation="mean")
+    lap_scores: Dict[int, float] = lap["combined_scores"]  # type: ignore
+
+    # 2. normal inconsistency
+    normal_scores = compute_normal_inconsistency_scores(
+        skin_mesh, normal_rings=normal_rings, adjacency=adjacency)
+
+    # 3. distance-to-anatomy (only if it contributes)
+    raw_distances: Dict[int, float] = {}
+    nearest_anatomy: Dict[int, Optional[str]] = {}
+    valid_meshes: List[str] = []
+    missing_meshes: List[str] = []
+    if w_distance > 0:
+        if not anatomical_meshes:
+            raise ValueError(
+                "distance_weight > 0 requires anatomical_meshes (e.g. INTERNAL_MESHES)")
+        dist = compute_distance_to_anatomy_scores(
+            skin_mesh, anatomical_meshes, distance_rings=distance_rings,
+            robust=True, adjacency=adjacency, epsilon=epsilon)
+        distance_scores: Dict[int, float] = dist["distance_scores"]  # type: ignore
+        raw_distances = dist["raw_distances"]                         # type: ignore
+        nearest_anatomy = dist["nearest_anatomy"]                     # type: ignore
+        valid_meshes = dist["valid_meshes"]                           # type: ignore
+        missing_meshes = dist["missing_meshes"]                       # type: ignore
+    else:
+        distance_scores = {i: 0.0 for i in range(v)}
+
+    # robust global normalization of each signal
+    norm_lap = robust_normalize_scores(lap_scores, epsilon=epsilon)
+    norm_normal = robust_normalize_scores(normal_scores, epsilon=epsilon)
+    norm_distance = robust_normalize_scores(distance_scores, epsilon=epsilon)
+
+    combined_scores: Dict[int, float] = {}
+    for i in range(v):
+        combined_scores[i] = (w_lap * norm_lap.get(i, 0.0)
+                              + w_normal * norm_normal.get(i, 0.0)
+                              + w_distance * norm_distance.get(i, 0.0))
+
+    statistics = {
+        "laplacian": summarize_scores(norm_lap),
+        "normal": summarize_scores(norm_normal),
+        "distance": summarize_scores(norm_distance),
+        "combined": summarize_scores(combined_scores),
+    }
+
+    return {
+        "combined_scores": combined_scores,
+        "laplacian_scores": norm_lap,
+        "normal_scores": norm_normal,
+        "distance_scores": norm_distance,
+        "raw_distances": raw_distances,
+        "nearest_anatomy": nearest_anatomy,
+        "weights": {"laplacian": w_lap, "normal": w_normal, "distance": w_distance},
+        "statistics": statistics,
+        "valid_meshes": valid_meshes,
+        "missing_meshes": missing_meshes,
+    }
+
+
+def compute_boundary_weights(mesh_name: str,
+                             max_rings: int = 3,
+                             ring_weights: Sequence[float] = (0.0, 0.25, 0.6, 1.0),
+                             adjacency: Optional[List[List[int]]] = None,
+                             ) -> Dict[int, float]:
+    """Soft per-vertex weight that ramps up with distance from a mesh boundary.
+
+    Ring distance ``d`` (edge steps to the nearest true boundary vertex) maps to
+    ``ring_weights[min(d, len-1)]``; vertices farther than ``max_rings`` get the
+    last weight. With the default ``(0.0, 0.25, 0.6, 1.0)``: boundary -> 0.0,
+    1 ring -> 0.25, 2 rings -> 0.6, >=3 rings -> 1.0. Multiplying scores by this
+    weight softly suppresses edge-like detections without hard deletion.
+
+    Distances come from a single multi-source BFS seeded at all boundary
+    vertices (found by edge topology, never position). Returns weight 1.0
+    everywhere if the mesh has no open boundary.
+
+    Raises
+    ------
+    ValueError
+        If ``max_rings < 0`` or ``ring_weights`` is empty.
+    """
+    from collections import deque
+
+    if max_rings < 0:
+        raise ValueError("max_rings must be >= 0, got {0}".format(max_rings))
+    if not ring_weights:
+        raise ValueError("ring_weights must be a non-empty sequence")
+
+    if adjacency is None:
+        adjacency = mesh_utils.get_vertex_neighbors(mesh_name)
+    v = len(adjacency)
+    last_weight = ring_weights[-1]
+    if v == 0:
+        return {}
+
+    boundary = find_boundary_vertices(mesh_name)
+    if not boundary:
+        return {i: last_weight for i in range(v)}
+
+    inf = max_rings + 1
+    dist = [inf] * v
+    dq = deque()
+    for b in boundary:
+        if 0 <= b < v:
+            dist[b] = 0
+            dq.append(b)
+    while dq:
+        u = dq.popleft()
+        if dist[u] >= max_rings:
+            continue
+        for w in adjacency[u]:
+            if dist[w] > dist[u] + 1:
+                dist[w] = dist[u] + 1
+                dq.append(w)
+
+    weights: Dict[int, float] = {}
+    for i in range(v):
+        d = dist[i]
+        if d > max_rings:
+            weights[i] = last_weight
+        else:
+            weights[i] = ring_weights[min(d, len(ring_weights) - 1)]
+    return weights
+
+
+def _validate_hybrid_detector_params(method, percentile, threshold,
+                                     min_component_size, final_growth_rings,
+                                     boundary_max_rings):
+    if method not in ("percentile", "zscore"):
+        raise ValueError(
+            "method must be 'percentile' or 'zscore', got '{0}'".format(method))
+    if not (0.0 <= percentile <= 100.0):
+        raise ValueError("percentile must be in [0, 100], got {0}".format(percentile))
+    if threshold < 0:
+        raise ValueError("threshold must be >= 0, got {0}".format(threshold))
+    if min_component_size < 1:
+        raise ValueError("min_component_size must be >= 1, got {0}".format(min_component_size))
+    if final_growth_rings < 0:
+        raise ValueError("final_growth_rings must be >= 0, got {0}".format(final_growth_rings))
+    if boundary_max_rings < 0:
+        raise ValueError("boundary_max_rings must be >= 0, got {0}".format(boundary_max_rings))
+
+
+def detect_hybrid_artifacts(skin_mesh: str,
+                            anatomical_meshes: Optional[Sequence[str]] = None,
+                            method: str = "percentile",
+                            percentile: float = 97.5,
+                            threshold: float = 2.5,
+                            laplacian_scales: Sequence[int] = (1, 2),
+                            normal_rings: int = 1,
+                            distance_rings: int = 2,
+                            laplacian_weight: float = 0.3,
+                            normal_weight: float = 0.2,
+                            distance_weight: float = 0.5,
+                            use_boundary_weights: bool = True,
+                            boundary_max_rings: int = 3,
+                            boundary_ring_weights: Sequence[float] = (0.0, 0.25, 0.6, 1.0),
+                            min_component_size: int = 3,
+                            final_growth_rings: int = 1,
+                            select: bool = True,
+                            epsilon: float = 1e-8,
+                            ) -> Tuple[List[int], Dict[str, object]]:
+    """M3 V2 detector: hybrid geometry + anatomy-aware artifact detection.
+
+    Pipeline (detection only -- never edits geometry): validate -> hybrid scores
+    -> soft boundary weighting -> outlier detection (reuses
+    :func:`detect_outliers`) -> connected components -> drop small components ->
+    grow survivors -> optional Maya selection.
+
+    Returns ``(final_indices, report)``; ``report`` holds valid/missing anatomy,
+    per-signal statistics, normalized weights, raw/boundary-suppressed counts,
+    component counts, final count, and the top-scoring vertices with their
+    nearest anatomical structures.
+    """
+    _validate_hybrid_detector_params(method, percentile, threshold,
+                                     min_component_size, final_growth_rings,
+                                     boundary_max_rings)
+
+    def _empty_report():
+        return {"mesh": skin_mesh, "valid_anatomy_count": 0, "missing_anatomy": [],
+                "per_signal_stats": {}, "weights": {}, "raw_detected_count": 0,
+                "boundary_suppressed_count": 0, "components_before_filter": 0,
+                "components_after_filter": 0, "final_count_before_growth": 0,
+                "final_count": 0, "top_vertices": [], "top_nearest_anatomy": {}}
+
+    if not mesh_utils.mesh_exists(skin_mesh):
+        print("[artifact_detection][M3V2] object '{0}' does not exist".format(skin_mesh))
+        return [], _empty_report()
+
+    adjacency = mesh_utils.get_vertex_neighbors(skin_mesh)
+    if not adjacency:
+        print("[artifact_detection][M3V2] could not read topology for '{0}'".format(skin_mesh))
+        return [], _empty_report()
+
+    # 2. hybrid scores
+    hybrid = compute_hybrid_artifact_scores(
+        skin_mesh, anatomical_meshes=anatomical_meshes,
+        laplacian_scales=laplacian_scales, normal_rings=normal_rings,
+        distance_rings=distance_rings, laplacian_weight=laplacian_weight,
+        normal_weight=normal_weight, distance_weight=distance_weight,
+        epsilon=epsilon)
+    combined: Dict[int, float] = hybrid["combined_scores"]  # type: ignore
+    if not combined:
+        print("[artifact_detection][M3V2] no scores computed")
+        return [], _empty_report()
+
+    # 3. soft boundary weighting
+    if use_boundary_weights:
+        bw = compute_boundary_weights(skin_mesh, max_rings=boundary_max_rings,
+                                      ring_weights=boundary_ring_weights,
+                                      adjacency=adjacency)
+        weighted = {i: combined[i] * bw.get(i, 1.0) for i in combined}
+    else:
+        weighted = dict(combined)
+
+    # 4. outlier detection (raw vs boundary-weighted)
+    raw_detected = set(detect_outliers(combined, method=method,
+                                       threshold=threshold, percentile=percentile,
+                                       min_score=0.0))
+    detected = set(detect_outliers(weighted, method=method, threshold=threshold,
+                                   percentile=percentile, min_score=0.0))
+    boundary_suppressed_count = len(raw_detected - detected)
+
+    # 5-6. components + drop small
+    components_before = connected_vertex_components(detected, adjacency)
+    filtered, comp_stats = filter_small_components(detected, adjacency, min_component_size)
+    final_count_before_growth = len(filtered)
+
+    # 7. grow survivors
+    final_indices = grow_vertex_set(filtered, adjacency, rings=final_growth_rings)
+
+    # top-scoring vertices + nearest anatomy
+    top = sorted(weighted.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
+    top_vertices = [(i, round(s, 4)) for i, s in top]
+    nearest_map = hybrid.get("nearest_anatomy", {})
+    top_nearest = {i: nearest_map.get(i) for i, _ in top}
+
+    report: Dict[str, object] = {
+        "mesh": skin_mesh,
+        "valid_anatomy_count": len(hybrid.get("valid_meshes", [])),
+        "missing_anatomy": hybrid.get("missing_meshes", []),
+        "per_signal_stats": hybrid.get("statistics", {}),
+        "weights": hybrid.get("weights", {}),
+        "raw_detected_count": len(raw_detected),
+        "boundary_suppressed_count": boundary_suppressed_count,
+        "components_before_filter": len(components_before),
+        "components_after_filter": comp_stats["components_after"],
+        "removed_small_component_vertices": comp_stats["removed_vertices"],
+        "final_count_before_growth": final_count_before_growth,
+        "final_count": len(final_indices),
+        "top_vertices": top_vertices,
+        "top_nearest_anatomy": top_nearest,
+    }
+
+    # concise report
+    w = report["weights"]
+    print("[artifact_detection][M3V2] '{0}' | weights lap={1:.2f} nrm={2:.2f} "
+          "dist={3:.2f} | anatomy {4} valid, {5} missing".format(
+              skin_mesh, w.get("laplacian", 0), w.get("normal", 0),
+              w.get("distance", 0), report["valid_anatomy_count"],
+              len(report["missing_anatomy"])))
+    if report["missing_anatomy"]:
+        print("  missing anatomy: {0}".format(", ".join(report["missing_anatomy"])))
+    for sig in ("laplacian", "normal", "distance", "combined"):
+        st = hybrid["statistics"].get(sig, {})  # type: ignore
+        if st:
+            print("  {0:9s}: mean={1:.3f} median={2:.3f} std={3:.3f} max={4:.3f}".format(
+                sig, st["mean"], st["median"], st["std"], st["max"]))
+    print("  detected {0} (boundary-suppressed {1}); components {2} -> {3} "
+          "(< {4} dropped)".format(
+              len(raw_detected), boundary_suppressed_count,
+              report["components_before_filter"], report["components_after_filter"],
+              min_component_size))
+    print("  final: {0} verts -> {1} after +{2} growth ring(s)".format(
+        final_count_before_growth, report["final_count"], final_growth_rings))
+
+    # 8. selection
+    if select and final_indices:
+        select_vertices(skin_mesh, final_indices)
+        print("[artifact_detection][M3V2] selected {0} vertices for inspection "
+              "(mesh unchanged)".format(len(final_indices)))
+
+    return final_indices, report

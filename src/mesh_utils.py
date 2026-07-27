@@ -165,6 +165,97 @@ def get_boundary_vertices(mesh_name):
     return boundary
 
 
+def get_vertex_normals(mesh_name):
+    """Return per-vertex unit normals in world space as a list of [x, y, z].
+
+    Index-aligned with the mesh's vertices. Uses ``MFnMesh.getVertexNormals``
+    (Maya API 2.0), which returns the averaged (not angle-weighted) normal per
+    vertex. Empty list outside Maya or if the mesh is missing.
+    """
+    if not MAYA_AVAILABLE:
+        return []
+    mesh_fn = get_mesh_fn(mesh_name)
+    if mesh_fn is None:
+        return []
+    normals = mesh_fn.getVertexNormals(False, om.MSpace.kWorld)
+    return [[n.x, n.y, n.z] for n in normals]
+
+
+def compute_closest_point_distances(points, meshes):
+    """Closest-surface distance from each query point to a set of meshes.
+
+    For every point in ``points`` (world-space ``[x, y, z]``), find the shortest
+    Euclidean distance to the union of the given ``meshes`` and which mesh is
+    nearest. One ``MMeshIntersector`` acceleration structure is built PER mesh
+    ONCE (not per query), and every point is tested against each; no per-vertex
+    ``cmds`` calls are made.
+
+    Returns
+    -------
+    dict
+        ``{"distances": [float, ...], "nearest": [mesh_name_or_None, ...],
+           "valid_meshes": [...], "missing_meshes": [...]}``. Distances default
+        to ``0.0`` (nearest ``None``) when no valid mesh exists.
+
+    Notes
+    -----
+    ``MMeshIntersector.getClosestPoint`` takes the query point in world space
+    (because the shape's inclusive world matrix is supplied to ``create``) and
+    returns a point in object space, which is transformed back to world before
+    measuring distance.
+    """
+    n_pts = len(points)
+    if not MAYA_AVAILABLE:
+        return {"distances": [0.0] * n_pts, "nearest": [None] * n_pts,
+                "valid_meshes": [], "missing_meshes": list(meshes)}
+
+    intersectors = []  # (name, MMeshIntersector, worldMatrix)
+    valid, missing = [], []
+    for name in meshes:
+        if not cmds.objExists(name):
+            missing.append(name)
+            continue
+        try:
+            sel = om.MSelectionList()
+            sel.add(name)
+            dag = sel.getDagPath(0)
+            if dag.apiType() == om.MFn.kTransform:
+                dag.extendToShape()
+            matrix = dag.inclusiveMatrix()
+            intersector = om.MMeshIntersector()
+            intersector.create(dag.node(), matrix)
+            intersectors.append((name, intersector, matrix))
+            valid.append(name)
+        except Exception:
+            missing.append(name)
+
+    distances = [0.0] * n_pts
+    nearest = [None] * n_pts
+    if not intersectors:
+        return {"distances": distances, "nearest": nearest,
+                "valid_meshes": valid, "missing_meshes": missing}
+
+    for k, p in enumerate(points):
+        wp = om.MPoint(p[0], p[1], p[2])
+        best_d = None
+        best_name = None
+        for name, intersector, matrix in intersectors:
+            pom = intersector.getClosestPoint(wp)
+            if pom is None:
+                continue
+            closest_world = om.MPoint(pom.point) * matrix
+            d = wp.distanceTo(closest_world)
+            if best_d is None or d < best_d:
+                best_d = d
+                best_name = name
+        if best_d is not None:
+            distances[k] = best_d
+            nearest[k] = best_name
+
+    return {"distances": distances, "nearest": nearest,
+            "valid_meshes": valid, "missing_meshes": missing}
+
+
 # =============================================================================
 # SELECTION / COMPONENT HELPERS
 # =============================================================================

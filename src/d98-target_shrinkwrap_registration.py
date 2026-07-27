@@ -2826,6 +2826,42 @@ def detect_multiscale_skin_artifacts(mesh_name=None, scales=(1, 2, 3),
         final_growth_rings=final_growth_rings, select=select, epsilon=epsilon)
 
 
+def detect_hybrid_skin_artifacts(skin_mesh=None, anatomical_meshes=None,
+                                 method="percentile", percentile=97.5,
+                                 threshold=2.5, laplacian_scales=(1, 2),
+                                 normal_rings=1, distance_rings=2,
+                                 laplacian_weight=0.3, normal_weight=0.2,
+                                 distance_weight=0.5, use_boundary_weights=True,
+                                 boundary_max_rings=3,
+                                 boundary_ring_weights=(0.0, 0.25, 0.6, 1.0),
+                                 min_component_size=3, final_growth_rings=1,
+                                 select=True, epsilon=1e-8):
+    """M3 V2 (experimental) hybrid geometry + anatomy-aware artifact detection.
+
+    Thin delegate to artifact_detection.detect_hybrid_artifacts. Combines
+    multi-scale Laplacian, surface-normal inconsistency, and local
+    distance-to-anatomy deviation (against INTERNAL_MESHES by default), with soft
+    boundary weighting. Detection ONLY -- never moves vertices or renames
+    objects. Returns ``(final_indices, report)``.
+    """
+    if not _helpers_ready():
+        return
+    skin_mesh = skin_mesh or SKIN_MESH
+    if anatomical_meshes is None:
+        anatomical_meshes = INTERNAL_MESHES
+    return artifact_detection.detect_hybrid_artifacts(
+        skin_mesh, anatomical_meshes=anatomical_meshes, method=method,
+        percentile=percentile, threshold=threshold,
+        laplacian_scales=laplacian_scales, normal_rings=normal_rings,
+        distance_rings=distance_rings, laplacian_weight=laplacian_weight,
+        normal_weight=normal_weight, distance_weight=distance_weight,
+        use_boundary_weights=use_boundary_weights,
+        boundary_max_rings=boundary_max_rings,
+        boundary_ring_weights=boundary_ring_weights,
+        min_component_size=min_component_size,
+        final_growth_rings=final_growth_rings, select=select, epsilon=epsilon)
+
+
 def backup_skin_mesh(suffix="_precleanup"):
     """Duplicate the skin mesh as a backup before cleanup (name preserved)."""
     if not _helpers_ready():
@@ -2848,7 +2884,8 @@ def save_cleanup_scene(path, force=False):
 if HELPERS_AVAILABLE:
     print("Post-registration cleanup helpers:")
     print("  detect_skin_artifacts(percentile=97.5)                - M1 AUTO-detect irregular verts (no edits)")
-    print("  detect_multiscale_skin_artifacts()                    - M3 multi-scale boundary-aware detect (exp.)")
+    print("  detect_multiscale_skin_artifacts()                    - M3 V1 multi-scale boundary-aware (exp.)")
+    print("  detect_hybrid_skin_artifacts()                        - M3 V2 hybrid geo+anatomy detect (exp.)")
     print("  cleanup_selected_region(strength=0.3, iterations=8)   - smooth viewport selection")
     print("  cleanup_named_region('lips', strength=0.3)            - smooth heuristic region")
     print("  backup_skin_mesh()                                    - duplicate skin before edits")
