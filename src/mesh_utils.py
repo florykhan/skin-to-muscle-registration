@@ -192,3 +192,85 @@ def grow_indices(neighbors, indices, rings=1):
                 added.update(neighbors[i])
         current |= added
     return sorted(current)
+
+
+# =============================================================================
+# CLOSEST-POINT / DISTANCE QUERIES (Maya API 2.0 acceleration)
+# =============================================================================
+# These are the shared, general-purpose distance primitives used by the
+# artifact-detection SDF work (M4). They wrap ``MFnMesh.getClosestPoint``
+# (Maya API 2.0), which maintains an internal spatial acceleration structure, so
+# repeated queries against the SAME ``MFnMesh`` do not rebuild that structure and
+# never fall back to slow per-call ``maya.cmds`` invocations. The d98
+# registration script has its own private ``get_closest_point_on_mesh`` used by
+# the (unchanged) registration algorithm; this is the reusable home for the same
+# API-2.0 primitive so higher-level modules do not each re-implement it.
+#
+# Coordinate space: ALL functions here operate in WORLD space (``MSpace.kWorld``)
+# and both accept and return world-space coordinates. Distances are UNSIGNED
+# Euclidean distances to the nearest surface point (there is no inside/outside
+# sign test).
+
+def closest_point_on_mesh(mesh_fn, point):
+    """Return ``(closest_xyz, distance)`` for the nearest point on a mesh.
+
+    Parameters
+    ----------
+    mesh_fn:
+        An ``MFnMesh`` (e.g. from :func:`get_mesh_fn`). Reused across many
+        queries so Maya's internal acceleration structure is built once.
+    point:
+        World-space ``[x, y, z]`` query point.
+
+    Returns
+    -------
+    (list[float], float)
+        The world-space closest point ``[x, y, z]`` and the UNSIGNED Euclidean
+        distance to it. Returns ``(point, inf)`` if the query fails or Maya is
+        unavailable, so callers can treat ``inf`` as "no hit".
+    """
+    if not MAYA_AVAILABLE or mesh_fn is None:
+        return list(point), float("inf")
+    try:
+        qp = om.MPoint(point[0], point[1], point[2])
+        cp, _face_id = mesh_fn.getClosestPoint(qp, om.MSpace.kWorld)
+        dist = math.sqrt((point[0] - cp.x) ** 2
+                         + (point[1] - cp.y) ** 2
+                         + (point[2] - cp.z) ** 2)
+        return [cp.x, cp.y, cp.z], dist
+    except Exception:
+        return list(point), float("inf")
+
+
+def get_boundary_vertices(mesh_name):
+    """Return the set of TRUE topological boundary vertex indices of a mesh.
+
+    A boundary vertex is any vertex touching an edge that borders only one face
+    (``MItMeshEdge.onBoundary()``). For a closed skin mesh this is empty; for a
+    skin sheet with holes it returns the rims of every opening -- eye openings,
+    lips/mouth opening, nostrils, the neck opening, and the outer mesh border.
+
+    Parameters
+    ----------
+    mesh_name:
+        Mesh to inspect (not modified).
+
+    Returns
+    -------
+    set[int]
+        Boundary vertex indices (empty if the mesh is missing, closed, or Maya
+        is unavailable).
+    """
+    if not MAYA_AVAILABLE:
+        return set()
+    mesh_fn = get_mesh_fn(mesh_name)
+    if mesh_fn is None:
+        return set()
+    boundary = set()
+    edge_iter = om.MItMeshEdge(mesh_fn.object())
+    while not edge_iter.isDone():
+        if edge_iter.onBoundary():
+            boundary.add(edge_iter.vertexId(0))
+            boundary.add(edge_iter.vertexId(1))
+        edge_iter.next()
+    return boundary

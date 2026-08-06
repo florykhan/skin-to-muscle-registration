@@ -2818,6 +2818,108 @@ def detect_reference_skin_artifacts(current_mesh=None, target_mesh=None,
         rings=rings, select=select, epsilon=epsilon)
 
 
+def _configure_m4_sdf_backend():
+    """Inject THIS script's SDF into artifact_detection so M4 reuses it.
+
+    artifact_detection cannot import this d98 *script*, so it exposes
+    ``configure_sdf_backend`` for dependency injection. We hand it this file's
+    ``get_mesh_fn`` (Maya API 2.0 MFnMesh accessor) and ``compute_sdf_for_point``
+    (the registration's smooth-min union distance field) so M4 evaluates the
+    SAME field the registration uses instead of building a second, incompatible
+    one. Called by the M4 wrapper below; safe to call repeatedly.
+    """
+    if not _helpers_ready() or not hasattr(artifact_detection, "configure_sdf_backend"):
+        return False
+    artifact_detection.configure_sdf_backend(
+        mesh_fn_provider=get_mesh_fn, point_sdf_fn=compute_sdf_for_point)
+    return True
+
+
+def summarize_skin_anatomy_distances(skin_mesh=None, anatomical_meshes=None,
+                                     sample_indices=None):
+    """M4 helper: report the current skin->anatomy distance distribution.
+
+    Use this BEFORE choosing an M4 ``target_offset`` so the offset is picked from
+    the scene's own scale (e.g. the observed median) rather than guessed. Thin
+    wrapper over ``artifact_detection.summarize_skin_sdf_values``; read-only.
+    """
+    if not _configure_m4_sdf_backend():
+        return
+    skin_mesh = skin_mesh or SKIN_MESH
+    anatomical_meshes = anatomical_meshes or INTERNAL_MESHES
+    return artifact_detection.summarize_skin_sdf_values(
+        skin_mesh, anatomical_meshes, sample_indices=sample_indices)
+
+
+def detect_sdf_reference_skin_artifacts(skin_mesh=None, anatomical_meshes=None,
+                                        target_offset=None, method="percentile",
+                                        percentile=97.5, threshold=2.5,
+                                        normalize=True, exclude_boundaries=True,
+                                        boundary_buffer_rings=1,
+                                        min_component_size=3,
+                                        final_growth_rings=1,
+                                        reapply_boundary_exclusion_after_growth=True,
+                                        max_iterations=10, tolerance=1e-4,
+                                        max_projection_distance=None,
+                                        min_score=0.0, select=True):
+    """M4 detector: SDF-reference Laplacian artifact detection (detection ONLY).
+
+    Replaces M2's supplied target mesh with an ANATOMY-DERIVED target: each skin
+    vertex is projected onto the iso-surface ``phi(x) = target_offset`` of the
+    internal-anatomy distance field (reusing THIS script's ``compute_sdf_for_point``),
+    keeping the skin's topology/correspondence, then scored by reference-Laplacian
+    disagreement -- with true topological boundary exclusion for the eye/mouth/
+    nostril/neck openings that hurt M2. Never edits or renames any mesh and never
+    creates geometry.
+
+    ``target_offset`` is REQUIRED (no guessed default): run
+    ``summarize_skin_anatomy_distances()`` first and pass e.g. the observed
+    median. Returns ``(final_indices, report)``.
+    """
+    if not _configure_m4_sdf_backend():
+        return
+    skin_mesh = skin_mesh or SKIN_MESH
+    anatomical_meshes = anatomical_meshes or INTERNAL_MESHES
+    if target_offset is None:
+        print("[M4] target_offset is REQUIRED. Run summarize_skin_anatomy_distances() "
+              "first, then pass e.g. target_offset=<observed median>.")
+        return [], {}
+    return artifact_detection.detect_sdf_reference_artifacts(
+        skin_mesh, anatomical_meshes, target_offset, method=method,
+        percentile=percentile, threshold=threshold, normalize=normalize,
+        exclude_boundaries=exclude_boundaries,
+        boundary_buffer_rings=boundary_buffer_rings,
+        min_component_size=min_component_size,
+        final_growth_rings=final_growth_rings,
+        reapply_boundary_exclusion_after_growth=reapply_boundary_exclusion_after_growth,
+        max_iterations=max_iterations, tolerance=tolerance,
+        max_projection_distance=max_projection_distance,
+        min_score=min_score, select=select)
+
+
+def compare_m2_m4_skin_artifacts(skin_mesh=None, provided_target_mesh=None,
+                                  anatomical_meshes=None, target_offset=None,
+                                  percentile=97.5, **kwargs):
+    """M4 helper: run M2 and M4 and compare detected sets (no selection).
+
+    Thin wrapper over ``artifact_detection.compare_m2_and_m4``. Neither set is
+    selected automatically; select ``result['m4_indices']`` (or ``m2_indices``)
+    afterwards to view one. Read-only.
+    """
+    if not _configure_m4_sdf_backend():
+        return
+    skin_mesh = skin_mesh or SKIN_MESH
+    provided_target_mesh = provided_target_mesh or TARGET_MESH
+    anatomical_meshes = anatomical_meshes or INTERNAL_MESHES
+    if target_offset is None:
+        print("[M4] target_offset is REQUIRED for M4. Run "
+              "summarize_skin_anatomy_distances() first.")
+        return
+    return artifact_detection.compare_m2_and_m4(
+        skin_mesh, provided_target_mesh, anatomical_meshes, target_offset,
+        percentile=percentile, **kwargs)
+
+
 def backup_skin_mesh(suffix="_precleanup"):
     """Duplicate the skin mesh as a backup before cleanup (name preserved)."""
     if not _helpers_ready():
@@ -2841,6 +2943,8 @@ if HELPERS_AVAILABLE:
     print("Post-registration cleanup helpers:")
     print("  detect_skin_artifacts(percentile=97.5)                - M1 AUTO-detect irregular verts (no edits)")
     print("  detect_reference_skin_artifacts(percentile=97.5)      - M2 reference-based detect (fewer false +)")
+    print("  summarize_skin_anatomy_distances()                    - M4 pick target_offset from scene scale")
+    print("  detect_sdf_reference_skin_artifacts(target_offset=..) - M4 SDF-reference detect (anatomy-derived)")
     print("  cleanup_selected_region(strength=0.3, iterations=8)   - smooth viewport selection")
     print("  cleanup_named_region('lips', strength=0.3)            - smooth heuristic region")
     print("  backup_skin_mesh()                                    - duplicate skin before edits")
