@@ -262,7 +262,14 @@ def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearan
                                    intersection_repair_growth_rings=0,
                                    skin_topology=None,
                                    intersection_tolerance=1e-6,
-                                   boundary_buffer_rings=1):
+                                   boundary_buffer_rings=1,
+                                   repair_mode="anatomy_supported_patch",
+                                   repair_blend_rings=2,
+                                   repair_ring_weights=(1.0, 0.6, 0.3),
+                                   repair_binary_search=True,
+                                   max_surface_repair_passes=5,
+                                   max_repair_displacement_ratio=1.0,
+                                   post_repair_relax=False):
     """Anatomy-constrained localized smoothing (see section header).
 
     Parameters
@@ -456,7 +463,14 @@ def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearan
             intersection_repair_step_ratio=intersection_repair_step_ratio,
             intersection_repair_growth_rings=intersection_repair_growth_rings,
             boundary_buffer_rings=boundary_buffer_rings,
-            intersection_tolerance=intersection_tolerance, verbose=verbose)
+            intersection_tolerance=intersection_tolerance, verbose=verbose,
+            repair_mode=repair_mode, repair_blend_rings=repair_blend_rings,
+            repair_ring_weights=repair_ring_weights,
+            repair_binary_search=repair_binary_search,
+            max_surface_repair_passes=max_surface_repair_passes,
+            max_repair_displacement_ratio=max_repair_displacement_ratio,
+            post_repair_relax=post_repair_relax,
+            clearance_policy=clearance_policy)
         work = irep["positions"]
         isect_metrics["intersection_repair_iterations"] = irep.get(
             "intersection_repair_iterations", 0)
@@ -470,6 +484,13 @@ def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearan
             "mean_intersection_repair_displacement", 0.0)
         isect_metrics["max_intersection_repair_displacement"] = irep.get(
             "max_intersection_repair_displacement", 0.0)
+        isect_metrics["repair_mode"] = irep.get("repair_mode")
+        isect_metrics["core_vertex_count"] = irep.get("core_vertex_count", 0)
+        isect_metrics["patch_vertex_count"] = irep.get("patch_vertex_count", 0)
+        isect_metrics["mean_displacement_gradient"] = irep.get(
+            "mean_displacement_gradient", 0.0)
+        isect_metrics["max_displacement_gradient"] = irep.get(
+            "max_displacement_gradient", 0.0)
         after_i = irep.get("report_after") or {}
         isect_metrics["intersecting_skin_face_count_after_prerepair"] = after_i.get(
             "intersecting_skin_face_count", 0)
@@ -601,7 +622,16 @@ def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearan
                         intersection_repair_growth_rings=0,
                         boundary_buffer_rings=boundary_buffer_rings,
                         intersection_tolerance=intersection_tolerance,
-                        binary_search_min_step=False, verbose=False)
+                        binary_search_min_step=False, verbose=False,
+                        repair_mode=repair_mode,
+                        repair_blend_rings=min(1, int(repair_blend_rings or 0)),
+                        repair_ring_weights=repair_ring_weights,
+                        repair_binary_search=repair_binary_search,
+                        max_surface_repair_passes=min(
+                            2, int(max_surface_repair_passes or 2)),
+                        max_repair_displacement_ratio=max_repair_displacement_ratio,
+                        post_repair_relax=False,
+                        clearance_policy=clearance_policy)
                     proposed = irep["positions"]
                     after_loc = irep.get("report_after") or {}
                     if after_loc.get("intersection_pair_count", 0) <= 0:

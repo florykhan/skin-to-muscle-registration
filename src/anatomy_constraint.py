@@ -22,7 +22,8 @@ This module adds:
 * a **surface-intersection / protrusion analyzer** (triangle-triangle) that
   catches anatomy faces piercing skin faces even when every skin vertex is
   still classified outside
-* iterative **outward intersection repair** before constrained smoothing
+* **surface-intersection repair** before constrained smoothing (default:
+  anatomy-supported patch; legacy per-vertex normal push kept for A/B)
 
 Complexity (documented, not optimized away):
     Exact query: O(M) ``getClosestPoint`` per evaluation, M = # anatomy meshes
@@ -1270,6 +1271,14 @@ DEFAULT_MAX_INTERSECTION_REPAIR_ITERATIONS = 20
 DEFAULT_INTERSECTION_REPAIR_STEP_RATIO = 0.10
 AUTO_REPAIR_INTERSECTION_CLASSES = ("crossing", "coplanar_overlap")
 DEBUG_ISECT_PREFIX = "smr_isect_dbg_"
+DEFAULT_REPAIR_MODE = "anatomy_supported_patch"
+DEFAULT_REPAIR_BLEND_RINGS = 2
+DEFAULT_REPAIR_RING_WEIGHTS = (1.0, 0.6, 0.3)
+DEFAULT_MAX_SURFACE_REPAIR_PASSES = 5
+DEFAULT_MAX_REPAIR_DISPLACEMENT_RATIO = 1.0
+DEFAULT_REPAIR_BINARY_SEARCH_STEPS = 8
+DEFAULT_SUPPORT_OFFSET_RATIO = 0.02
+DEFAULT_HARMONIC_DISPLACEMENT_ITERS = 40
 
 
 def _aabb_from_points(pts, pad=0.0):
@@ -1840,7 +1849,7 @@ def intersection_vertices_from_report(report, skin_topology, allowed=None,
     return sorted(core)
 
 
-def resolve_skin_anatomy_intersections(
+def _legacy_normal_push_intersection_repair(
         positions, skin_indices, backend,
         skin_mesh=None, neighbors=None, normals=None, skin_topology=None,
         min_clearance=0.8, clearance_tolerance=DEFAULT_CLEARANCE_TOLERANCE,
@@ -1852,12 +1861,11 @@ def resolve_skin_anatomy_intersections(
         repair_classes=AUTO_REPAIR_INTERSECTION_CLASSES,
         binary_search_min_step=True,
         verbose=True):
-    """Move intersecting skin vertices OUTWARD until crossings are gone.
+    """V1 intersection repair: repeated per-vertex skin-normal escape.
 
-    Does not run Laplacian smoothing. Uncertain/touching pairs are not
-    auto-repaired. Opening-boundary vertices (buffered) are not moved.
-    Optional group binary-search finds an approximate *minimal* outward scale
-    once a full step has cleared the local crossings.
+    Preserved for A/B comparison (``repair_mode="legacy_normal_push"``).
+    This is the spike-prone method: isolated core vertices step along their
+    own normals by a fraction of local edge length. Do NOT use as the default.
     """
     work = [list(v) for v in positions]
     n = len(work)
@@ -1972,10 +1980,823 @@ def resolve_skin_anatomy_intersections(
                   len(resolved_faces), len(unresolved_faces),
                   result["mean_intersection_repair_displacement"],
                   result["max_intersection_repair_displacement"]))
+    result["repair_mode"] = "legacy_normal_push"
+    result["repair_passes"] = iters_used
+    result["intersecting_faces_before"] = before.get("intersecting_skin_face_count", 0)
+    result["intersecting_faces_after"] = after.get("intersecting_skin_face_count", 0)
+    result["intersection_pairs_before"] = before.get("intersection_pair_count", 0)
+    result["intersection_pairs_after"] = after.get("intersection_pair_count", 0)
+    result["core_vertex_count"] = len(moved)
+    result["patch_vertex_count"] = len(moved)
+    result["core_vertices"] = sorted(moved)
+    result["patch_vertices"] = sorted(moved)
+    result["unresolved_intersection_faces"] = unresolved_faces
+    result["unresolved_core_vertices"] = intersection_vertices_from_report(
+        after, skin_topology, allowed=allowed, boundary=boundary)
+    result["offending_anatomy_meshes"] = list(
+        after.get("intersecting_anatomy_meshes") or before.get("intersecting_anatomy_meshes") or [])
+    result["mean_core_target_distance"] = result["mean_intersection_repair_displacement"]
+    result["max_core_target_distance"] = result["max_intersection_repair_displacement"]
+    result["mean_applied_displacement"] = result["mean_intersection_repair_displacement"]
+    result["max_applied_displacement"] = result["max_intersection_repair_displacement"]
+    result["binary_search_count"] = 0
+    result["post_relax_displacement"] = 0.0
+    v1_field = {}
+    for i in moved:
+        v1_field[i] = vec_sub(work[i], positions[i])
+    qv1 = _measure_patch_repair_quality(v1_field, neighbors, work)
+    result["mean_displacement_gradient"] = qv1["mean_displacement_gradient"]
+    result["max_displacement_gradient"] = qv1["max_displacement_gradient"]
+    return result
+
+
+def _exact_closest_named(backend, point, mesh_name):
+    if backend is None:
+        return {
+            "distance": float("inf"), "closest": list(point),
+            "normal": [0.0, 0.0, 1.0], "mesh": mesh_name, "face_id": -1,
+            "category": "other", "hits": [],
+        }
+    if mesh_name:
+        try:
+            return backend.exact_closest(point, names=[mesh_name])
+        except TypeError:
+            pass
+    return backend.exact_closest(point)
+
+
+def _closest_point_on_triangle(point, tri):
+    """Return (closest, unnormalized_normal) of ``point`` on triangle ``tri``."""
+    a, b, c = tri
+    ab = vec_sub(b, a)
+    ac = vec_sub(c, a)
+    n_raw = vec_cross(ab, ac)
+    ap = vec_sub(point, a)
+    d1 = vec_dot(ab, ap)
+    d2 = vec_dot(ac, ap)
+    if d1 <= 0.0 and d2 <= 0.0:
+        return list(a), n_raw
+    bp = vec_sub(point, b)
+    d3 = vec_dot(ab, bp)
+    d4 = vec_dot(ac, bp)
+    if d3 >= 0.0 and d4 <= d3:
+        return list(b), n_raw
+    vc = d1 * d4 - d3 * d2
+    if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+        v = d1 / (d1 - d3) if abs(d1 - d3) > 1e-18 else 0.0
+        return vec_add(a, vec_scale(ab, v)), n_raw
+    cp = vec_sub(point, c)
+    d5 = vec_dot(ab, cp)
+    d6 = vec_dot(ac, cp)
+    if d6 >= 0.0 and d5 <= d6:
+        return list(c), n_raw
+    vb = d5 * d2 - d1 * d6
+    if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+        w = d2 / (d2 - d6) if abs(d2 - d6) > 1e-18 else 0.0
+        return vec_add(a, vec_scale(ac, w)), n_raw
+    va = d3 * d6 - d5 * d4
+    if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
+        denom = (d4 - d3) + (d5 - d6)
+        w = (d4 - d3) / denom if abs(denom) > 1e-18 else 0.0
+        return vec_add(b, vec_scale(vec_sub(c, b), w)), n_raw
+    denom = va + vb + vc
+    if abs(denom) < 1e-18:
+        return list(a), n_raw
+    v = vb / denom
+    w = vc / denom
+    return vec_add(a, vec_add(vec_scale(ab, v), vec_scale(ac, w))), n_raw
+
+
+def _orient_support_normal(n_anat, n_skin):
+    """Agree anatomy normal with skin outward; fall back to skin if degenerate."""
+    n_skin_u = vec_normalize(n_skin) if n_skin is not None else [0.0, 0.0, 1.0]
+    if vec_length(n_skin_u) < 1e-12:
+        n_skin_u = [0.0, 0.0, 1.0]
+    if n_anat is None or vec_length(n_anat) < 1e-12:
+        return n_skin_u, "skin_fallback"
+    n = vec_normalize(n_anat)
+    if vec_dot(n, n_skin_u) < 0.0:
+        n = vec_scale(n, -1.0)
+    return n, "oriented_anatomy"
+
+
+def _support_from_record(backend, point, rec):
+    """Closest point + raw anatomy normal for one intersection record.
+
+    Prefers the recorded anatomy face in the EXISTING surface cache (no
+    accelerator rebuild), then ``exact_closest`` on that mesh, then the
+    recorded intersection point.
+    """
+    mesh = (rec or {}).get("anatomy_mesh")
+    face_id = (rec or {}).get("anatomy_face_id")
+    rec_pt = (rec or {}).get("point")
+    closest = None
+    n_raw = None
+    dist = float("inf")
+    source = "none"
+    cache = {}
+    if backend is not None and hasattr(backend, "anatomy_surface_cache"):
+        try:
+            cache = backend.anatomy_surface_cache() or {}
+        except Exception:
+            cache = {}
+    entry = cache.get(mesh) if mesh else None
+    if entry:
+        tris = entry.get("triangles") or []
+        tpts = entry.get("tri_points") or []
+        if face_id is not None:
+            for ti, tdef in enumerate(tris):
+                if tdef[0] != face_id or ti >= len(tpts):
+                    continue
+                cp, n_raw = _closest_point_on_triangle(point, tpts[ti])
+                closest = cp
+                dist = vec_length(vec_sub(point, cp))
+                source = "cache_face"
+                break
+        if closest is None:
+            for tp in tpts:
+                cp, nr = _closest_point_on_triangle(point, tp)
+                d = vec_length(vec_sub(point, cp))
+                if d < dist:
+                    dist, closest, n_raw = d, cp, nr
+                    source = "cache_mesh"
+    if closest is None:
+        q = _exact_closest_named(backend, point, mesh)
+        qdist = q.get("distance", float("inf"))
+        if q.get("mesh") and math.isfinite(qdist):
+            closest = list(q["closest"])
+            n_raw = list(q.get("normal") or [0.0, 0.0, 0.0])
+            dist = qdist
+            source = "exact_closest"
+    if closest is None and rec_pt is not None:
+        closest = list(rec_pt)
+        source = "intersection_point"
+        dist = vec_length(vec_sub(point, closest))
+    if closest is None:
+        closest = list(point)
+        dist = 0.0
+        source = "identity"
+    return {
+        "closest": closest,
+        "normal": n_raw,
+        "distance": dist,
+        "mesh": mesh,
+        "source": source,
+    }
+
+
+def _collect_offending_anatomy(report, skin_topology, core):
+    """Map each core vertex to intersection records of its incident faces.
+
+    Reuses the EXISTING analyzer's ``details`` when present; otherwise falls
+    back to ``intersecting_anatomy_meshes`` for every core vertex.
+    """
+    by_vert = {i: [] for i in core}
+    details = report.get("details") or []
+    face_verts = (skin_topology or {}).get("face_vertex_ids") or []
+    meshes = list(report.get("intersecting_anatomy_meshes") or [])
+    stub = [{"anatomy_mesh": m, "anatomy_face_id": None, "point": None,
+             "classification": "crossing"} for m in meshes]
+    if details:
+        for rec in details:
+            if rec.get("classification") not in AUTO_REPAIR_INTERSECTION_CLASSES:
+                continue
+            fi = rec.get("skin_face_id")
+            verts = list(rec.get("skin_vertex_indices") or [])
+            if not verts and fi is not None and fi < len(face_verts):
+                verts = list(face_verts[fi])
+            for v in verts:
+                if v in by_vert:
+                    by_vert[v].append(rec)
+        for i in core:
+            if not by_vert[i]:
+                by_vert[i] = list(stub)
+        return by_vert
+    for i in core:
+        by_vert[i] = list(stub)
+    return by_vert
+
+
+def _compute_anatomy_supported_target(point, skin_normal, offending_records,
+                                      backend, offset, max_disp):
+    """Place ``point`` just outside ALL offending anatomy surfaces.
+
+    Motion is along the oriented support normal only (no tangential snap to
+    the closest point). Multiple meshes are applied sequentially -- never
+    averaged, because an average can recross one of the surfaces.
+    """
+    cand = list(point)
+    method = "none"
+    last_n = list(skin_normal) if skin_normal is not None else [0.0, 0.0, 1.0]
+    last_p = list(point)
+    candidates_info = []
+    recs = list(offending_records or [])
+    if not recs:
+        recs = [{}]
+    for _pass in range(3):
+        moved = False
+        for rec in recs:
+            sup = _support_from_record(backend, cand, rec)
+            n, method_i = _orient_support_normal(sup.get("normal"), skin_normal)
+            p_i = sup["closest"]
+            side = vec_dot(vec_sub(cand, p_i), n)
+            if side < offset - 1e-12:
+                cand = vec_add(cand, vec_scale(n, offset - side))
+                last_n, last_p = n, list(p_i)
+                method = method_i + "+" + sup.get("source", "")
+                moved = True
+            candidates_info.append({
+                "mesh": rec.get("anatomy_mesh"),
+                "source": sup.get("source"),
+                "method": method_i,
+                "closest": list(p_i),
+                "normal": list(n),
+            })
+        if not moved:
+            break
+    disp = vec_sub(cand, point)
+    mag = vec_length(disp)
+    if max_disp is not None and mag > max_disp > 0.0:
+        cand = vec_add(point, vec_scale(disp, max_disp / mag))
+        mag = max_disp
+        method = method + "+clamped"
+    meshes = []
+    for rec in recs:
+        m = rec.get("anatomy_mesh")
+        if m and m not in meshes:
+            meshes.append(m)
+    return cand, {
+        "support_method": method,
+        "support_normal": last_n,
+        "closest": last_p,
+        "target": list(cand),
+        "target_distance": mag,
+        "offending_meshes": meshes,
+        "candidate_supports": candidates_info,
+    }
+
+
+def _find_minimal_safe_target(base, field, analyze_fn, steps=8,
+                              position_tolerance=None):
+    """Binary-search the scale of a patch displacement field.
+
+    Face intersections cannot be decided per vertex, so the search is on the
+    whole field: ``x' = x + alpha * d``, smallest ``alpha`` in [0, 1] that
+    locally clears. If alpha=1 is still intersecting, returns that candidate
+    for the next repair pass (does not invent extra extrusion).
+    """
+    full = [list(v) for v in base]
+    for i, di in field.items():
+        full[i] = vec_add(base[i], di)
+    full_rep = analyze_fn(full)
+    if full_rep.get("intersection_pair_count", 0) > 0:
+        return full, 1.0, 0, False
+    lo, hi = 0.0, 1.0
+    best = [list(v) for v in full]
+    nsteps = max(1, int(steps))
+    max_mag = max((vec_length(d) for d in field.values()), default=0.0)
+    searches = 0
+    for _ in range(nsteps):
+        if (position_tolerance is not None and max_mag > 0.0
+                and (hi - lo) * max_mag <= float(position_tolerance)):
+            break
+        searches += 1
+        mid = 0.5 * (lo + hi)
+        trial = [list(v) for v in base]
+        for i, di in field.items():
+            trial[i] = vec_add(base[i], vec_scale(di, mid))
+        tr = analyze_fn(trial)
+        if tr.get("intersection_pair_count", 0) <= 0:
+            hi = mid
+            best = trial
+        else:
+            lo = mid
+    return best, hi, searches, True
+
+
+def _build_intersection_repair_patch(core, neighbors, allowed, boundary,
+                                     blend_rings, ring_weights):
+    """Core + topological rings. Boundary verts never enter the patch."""
+    core_set = set(core)
+    boundary = set(boundary or [])
+    allowed = set(allowed or core_set)
+    weights = {i: float(ring_weights[0]) if ring_weights else 1.0
+               for i in core_set}
+    rings = [set(core_set)]
+    current = set(core_set)
+    n_rings = max(0, int(blend_rings or 0))
+    for r in range(1, n_rings + 1):
+        nxt = set()
+        w = (ring_weights[r] if ring_weights and r < len(ring_weights)
+             else (ring_weights[-1] if ring_weights else 0.3))
+        for i in current:
+            if neighbors is None or i >= len(neighbors):
+                continue
+            for j in neighbors[i]:
+                if j in current or j in boundary or j not in allowed:
+                    continue
+                nxt.add(j)
+                if j not in weights:
+                    weights[j] = float(w)
+        rings.append(nxt)
+        current |= nxt
+    outer = []
+    for i in current:
+        if i in core_set:
+            continue
+        nbrs = neighbors[i] if (neighbors is not None and i < len(neighbors)) else []
+        if not nbrs or any(j not in current for j in nbrs):
+            outer.append(i)
+    return {
+        "core": sorted(core_set),
+        "patch": sorted(current),
+        "rings": [sorted(s) for s in rings],
+        "weights": weights,
+        "outer": sorted(outer),
+    }
+
+
+def _blend_patch_displacements(core_disp, patch_info, neighbors,
+                               method="harmonic", harmonic_iters=None):
+    """Smooth displacement field: core pinned, outer ring ~0."""
+    patch = patch_info["patch"]
+    core_set = set(patch_info["core"])
+    outer_set = set(patch_info["outer"])
+    patch_set = set(patch)
+    weights = patch_info.get("weights") or {}
+    d = {i: [0.0, 0.0, 0.0] for i in patch}
+    for i, vec in (core_disp or {}).items():
+        if i in d:
+            d[i] = list(vec)
+    if method != "harmonic" or neighbors is None:
+        if core_disp:
+            mean_c = [
+                sum(v[k] for v in core_disp.values()) / float(len(core_disp))
+                for k in range(3)]
+        else:
+            mean_c = [0.0, 0.0, 0.0]
+        for i in patch:
+            if i in core_set:
+                continue
+            d[i] = vec_scale(mean_c, float(weights.get(i, 0.0)))
+        for i in outer_set:
+            d[i] = [0.0, 0.0, 0.0]
+        return d
+    interior = [i for i in patch if i not in core_set and i not in outer_set]
+    n_iter = int(harmonic_iters if harmonic_iters is not None
+                 else DEFAULT_HARMONIC_DISPLACEMENT_ITERS)
+    for _ in range(max(1, n_iter)):
+        new_d = {}
+        for i in interior:
+            nbrs = [j for j in neighbors[i] if j in patch_set] if i < len(neighbors) else []
+            if not nbrs:
+                continue
+            new_d[i] = [
+                sum(d[j][k] for j in nbrs) / float(len(nbrs)) for k in range(3)]
+        d.update(new_d)
+    for i in outer_set:
+        d[i] = [0.0, 0.0, 0.0]
+    return d
+
+
+def _measure_patch_repair_quality(displacements, neighbors, positions=None):
+    grads, mags = [], []
+    for i, di in (displacements or {}).items():
+        mags.append(vec_length(di))
+        if neighbors is None or i >= len(neighbors):
+            continue
+        g = 0.0
+        for j in neighbors[i]:
+            dj = displacements.get(j, [0.0, 0.0, 0.0])
+            g = max(g, vec_length(vec_sub(di, dj)))
+        grads.append(g)
+    lap = []
+    if positions is not None and neighbors is not None:
+        for i in displacements or {}:
+            nbrs = neighbors[i] if i < len(neighbors) else []
+            if not nbrs:
+                continue
+            avg = [
+                sum(positions[j][k] for j in nbrs) / float(len(nbrs))
+                for k in range(3)]
+            lap.append(vec_length(vec_sub(positions[i], avg)))
+    return {
+        "mean_displacement_gradient": (sum(grads) / len(grads)) if grads else 0.0,
+        "max_displacement_gradient": max(grads) if grads else 0.0,
+        "mean_applied_displacement": (sum(mags) / len(mags)) if mags else 0.0,
+        "max_applied_displacement": max(mags) if mags else 0.0,
+        "mean_laplacian_magnitude": (sum(lap) / len(lap)) if lap else 0.0,
+        "max_laplacian_magnitude": max(lap) if lap else 0.0,
+    }
+
+
+def _local_taubin_step(positions, neighbors, indices, strength):
+    """One lambda+mu pair on ``indices`` only (no module-level Laplacian import)."""
+    idx = [i for i in indices]
+    lamb = float(strength)
+    mu = -(lamb + 0.01)
+
+    def _step(pos, s):
+        out = [list(p) for p in pos]
+        for i in idx:
+            nbrs = neighbors[i] if (neighbors is not None and i < len(neighbors)) else []
+            if not nbrs:
+                continue
+            avg = [
+                sum(pos[j][k] for j in nbrs) / float(len(nbrs)) for k in range(3)]
+            out[i] = [pos[i][k] + s * (avg[k] - pos[i][k]) for k in range(3)]
+        return out
+
+    mid = _step(positions, lamb)
+    return _step(mid, mu)
+
+
+def _anatomy_supported_patch_repair(
+        positions, skin_indices, backend,
+        skin_mesh=None, neighbors=None, normals=None, skin_topology=None,
+        min_clearance=0.8, clearance_tolerance=DEFAULT_CLEARANCE_TOLERANCE,
+        clearance_policy="preserve_valid_baseline",
+        boundary_buffer_rings=1,
+        intersection_tolerance=DEFAULT_INTERSECTION_TOLERANCE,
+        repair_blend_rings=DEFAULT_REPAIR_BLEND_RINGS,
+        repair_ring_weights=DEFAULT_REPAIR_RING_WEIGHTS,
+        repair_binary_search=True,
+        repair_binary_search_steps=DEFAULT_REPAIR_BINARY_SEARCH_STEPS,
+        max_surface_repair_passes=DEFAULT_MAX_SURFACE_REPAIR_PASSES,
+        max_repair_displacement_ratio=DEFAULT_MAX_REPAIR_DISPLACEMENT_RATIO,
+        post_repair_relax=True,
+        post_repair_relax_iterations=3,
+        post_repair_relax_strength=0.1,
+        repair_position_tolerance=None,
+        verbose=True):
+    """V2: place the intersecting core just outside offending anatomy, then
+    distribute that displacement as a smooth patch field (not per-vertex
+    normal extrusion). Re-tests with the UNCHANGED intersection analyzer.
+    """
+    t0 = time.time()
+    work = [list(v) for v in positions]
+    n = len(work)
+    region = [i for i in (skin_indices or range(n)) if 0 <= i < n]
+    boundary = _buffered_boundary_vertices(
+        skin_mesh, neighbors, boundary_buffer_rings)
+    allowed = set(region)
+    if repair_blend_rings and neighbors is not None:
+        allowed = set(grow_indices(neighbors, list(region),
+                                   rings=int(repair_blend_rings)))
+    allowed -= set(boundary)
+    floors, orig_dist, policy = {}, {}, clearance_policy or "preserve_valid_baseline"
+    if backend is not None and min_clearance is not None:
+        floors, orig_dist, policy = compute_clearance_floors(
+            work, sorted(allowed) or region, backend, min_clearance,
+            clearance_policy=policy)
+
+    def _analyze(pos, indices=None, detailed=False):
+        return analyze_skin_anatomy_intersections(
+            skin_mesh,
+            skin_indices=indices if indices is not None else region,
+            backend=backend, positions=pos, neighbors=neighbors,
+            skin_topology=skin_topology,
+            boundary_buffer_rings=boundary_buffer_rings,
+            intersection_tolerance=intersection_tolerance,
+            detailed=detailed, verbose=False)
+
+    before = _analyze(work, detailed=True)
+    last = before
+    patch_info = {"core": [], "patch": [], "weights": {}, "outer": [], "rings": []}
+    quality = _measure_patch_repair_quality({}, neighbors)
+    binary_count = 0
+    unresolved_core = []
+    per_vertex = {}
+    target_dists = []
+    offending_meshes = set(before.get("intersecting_anatomy_meshes") or [])
+    applied_field = {}
+    passes = 0
+    weights_t = tuple(repair_ring_weights or DEFAULT_REPAIR_RING_WEIGHTS)
+
+    for p_i in range(max(1, int(max_surface_repair_passes))):
+        passes = p_i + 1
+        last = _analyze(work, detailed=True)
+        if last.get("intersection_pair_count", 0) <= 0:
+            break
+        core = intersection_vertices_from_report(
+            last, skin_topology, allowed=allowed, boundary=boundary)
+        if not core:
+            break
+        patch_info = _build_intersection_repair_patch(
+            core, neighbors, allowed, boundary,
+            repair_blend_rings, weights_t)
+        bset = set(boundary)
+        patch_info["core"] = [i for i in patch_info["core"] if i not in bset]
+        patch_info["patch"] = [i for i in patch_info["patch"] if i not in bset]
+        patch_info["outer"] = [i for i in patch_info["outer"] if i not in bset]
+        patch_info["weights"] = {
+            i: w for i, w in (patch_info.get("weights") or {}).items()
+            if i not in bset}
+        core = list(patch_info["core"])
+        if not core:
+            break
+        offending = _collect_offending_anatomy(last, skin_topology, core)
+        core_disp = {}
+        per_vertex = {}
+        target_dists = []
+        for i in core:
+            nrm = _outward_skin_normal(i, normals, work, skin_topology)
+            edge = _mean_local_edge(work, neighbors, i)
+            standoff = max(1e-4, DEFAULT_SUPPORT_OFFSET_RATIO * (edge if edge > 1e-12 else 1.0))
+            if policy == "global" and min_clearance is not None:
+                offset = max(standoff, float(min_clearance))
+            else:
+                offset = standoff
+            max_disp = None
+            if max_repair_displacement_ratio is not None and edge > 1e-12:
+                max_disp = float(max_repair_displacement_ratio) * edge
+            target, info = _compute_anatomy_supported_target(
+                work[i], nrm, offending.get(i), backend, offset, max_disp)
+            core_disp[i] = vec_sub(target, work[i])
+            info["weight"] = 1.0
+            info["local_edge"] = edge
+            info["offset"] = offset
+            info["skin_position"] = list(work[i])
+            info["skin_normal"] = list(nrm) if nrm is not None else None
+            per_vertex[i] = info
+            target_dists.append(info["target_distance"])
+            offending_meshes.update(info.get("offending_meshes") or [])
+        field = _blend_patch_displacements(
+            core_disp, patch_info, neighbors, method="harmonic")
+        if max_repair_displacement_ratio is not None:
+            for i, di in list(field.items()):
+                mag = vec_length(di)
+                edge_i = _mean_local_edge(work, neighbors, i)
+                cap = float(max_repair_displacement_ratio) * (
+                    edge_i if edge_i > 1e-12 else 1.0)
+                if mag > cap > 0.0:
+                    field[i] = vec_scale(di, cap / mag)
+        base = [list(v) for v in work]
+        alpha_used = 1.0
+        if repair_binary_search:
+            chosen, alpha_used, nsearch, _cleared = _find_minimal_safe_target(
+                base, field, lambda pos: _analyze(pos),
+                steps=repair_binary_search_steps,
+                position_tolerance=repair_position_tolerance)
+            binary_count += nsearch
+        else:
+            chosen = [list(v) for v in base]
+            for i, di in field.items():
+                chosen[i] = vec_add(base[i], di)
+        work = chosen
+        applied_field = {}
+        for i, di in field.items():
+            applied_field[i] = vec_scale(di, alpha_used)
+            if i in per_vertex:
+                per_vertex[i]["applied_displacement"] = list(applied_field[i])
+                per_vertex[i]["binary_search_alpha"] = alpha_used
+                per_vertex[i]["final_position"] = list(work[i])
+        if min_clearance is not None and backend is not None:
+            for i in patch_info["patch"]:
+                if i in boundary:
+                    continue
+                edge_i = _mean_local_edge(work, neighbors, i)
+                standoff_i = max(
+                    1e-4,
+                    DEFAULT_SUPPORT_OFFSET_RATIO * (
+                        edge_i if edge_i > 1e-12 else 1.0))
+                if policy == "global":
+                    floor_i = floors.get(i, float(min_clearance))
+                else:
+                    floor_i = floors.get(i, standoff_i)
+                nrm = _outward_skin_normal(i, normals, work, skin_topology)
+                sol = enforce_anatomy_clearance(
+                    work[i], backend, floor_i,
+                    clearance_tolerance=clearance_tolerance, skin_normal=nrm)
+                work[i] = sol["position"]
+        last = _analyze(work, detailed=True)
+        if last.get("intersection_pair_count", 0) <= 0:
+            break
+        unresolved_core = intersection_vertices_from_report(
+            last, skin_topology, allowed=allowed, boundary=boundary)
+
+    after_geom = last
+    post_relax_disp = 0.0
+    if (post_repair_relax and patch_info.get("patch")
+            and after_geom.get("intersection_pair_count", 0) <= 0):
+        before_relax = [list(v) for v in work]
+        relaxed = [list(v) for v in work]
+        ok = True
+        interior = [i for i in patch_info["patch"]
+                    if i not in set(patch_info.get("outer") or [])
+                    and i not in set(boundary)]
+        for _ in range(max(0, int(post_repair_relax_iterations))):
+            trial = _local_taubin_step(
+                relaxed, neighbors, interior, post_repair_relax_strength)
+            tr = _analyze(trial, indices=patch_info["patch"])
+            if tr.get("intersection_pair_count", 0) > 0:
+                ok = False
+                break
+            relaxed = trial
+        if ok:
+            work = relaxed
+            after_geom = _analyze(work, detailed=True)
+            post_relax_disp = (
+                sum(vec_length(vec_sub(work[i], before_relax[i]))
+                    for i in patch_info["patch"])
+                / float(len(patch_info["patch"]))) if patch_info["patch"] else 0.0
+
+    after = after_geom
+    quality = _measure_patch_repair_quality(applied_field, neighbors, work)
+    moved = sorted(i for i, di in applied_field.items() if vec_length(di) > 1e-12)
+    unresolved_faces = after.get("intersecting_skin_faces") or []
+    result = {
+        "positions": work,
+        "repair_mode": "anatomy_supported_patch",
+        "report_before": before,
+        "report_after": after,
+        "intersecting_faces_before": before.get("intersecting_skin_face_count", 0),
+        "intersecting_faces_after": after.get("intersecting_skin_face_count", 0),
+        "intersection_pairs_before": before.get("intersection_pair_count", 0),
+        "intersection_pairs_after": after.get("intersection_pair_count", 0),
+        "intersection_repair_iterations": passes,
+        "repair_passes": passes,
+        "intersection_vertices_moved": moved,
+        "intersection_faces_resolved": max(
+            0, before.get("intersecting_skin_face_count", 0)
+            - after.get("intersecting_skin_face_count", 0)),
+        "intersection_faces_unresolved": len(unresolved_faces),
+        "unresolved_intersecting_faces": unresolved_faces,
+        "unresolved_intersection_faces": unresolved_faces,
+        "unresolved_core_vertices": unresolved_core,
+        "core_vertex_count": len(patch_info.get("core") or []),
+        "patch_vertex_count": len(patch_info.get("patch") or []),
+        "core_vertices": list(patch_info.get("core") or []),
+        "patch_vertices": list(patch_info.get("patch") or []),
+        "patch_weights": dict(patch_info.get("weights") or {}),
+        "offending_anatomy_meshes": sorted(offending_meshes),
+        "mean_core_target_distance": (
+            (sum(target_dists) / len(target_dists)) if target_dists else 0.0),
+        "max_core_target_distance": max(target_dists) if target_dists else 0.0,
+        "mean_applied_displacement": quality["mean_applied_displacement"],
+        "max_applied_displacement": quality["max_applied_displacement"],
+        "mean_intersection_repair_displacement": quality["mean_applied_displacement"],
+        "max_intersection_repair_displacement": quality["max_applied_displacement"],
+        "mean_displacement_gradient": quality["mean_displacement_gradient"],
+        "max_displacement_gradient": quality["max_displacement_gradient"],
+        "binary_search_count": binary_count,
+        "post_relax_displacement": post_relax_disp,
+        "clearance_policy": policy,
+        "per_vertex": per_vertex,
+        "runtime_seconds": time.time() - t0,
+        "mean_laplacian_magnitude": quality.get("mean_laplacian_magnitude", 0.0),
+        "max_laplacian_magnitude": quality.get("max_laplacian_magnitude", 0.0),
+    }
+    if verbose:
+        print("[intersection-repair V2] passes={0} faces {1}->{2} pairs {3}->{4} "
+              "core={5} patch={6} mean/max disp={7:.5f}/{8:.5f} "
+              "max_grad={9:.5f} unresolved={10}".format(
+                  passes,
+                  result["intersecting_faces_before"],
+                  result["intersecting_faces_after"],
+                  result["intersection_pairs_before"],
+                  result["intersection_pairs_after"],
+                  result["core_vertex_count"], result["patch_vertex_count"],
+                  result["mean_applied_displacement"],
+                  result["max_applied_displacement"],
+                  result["max_displacement_gradient"],
+                  result["intersection_faces_unresolved"]))
+    return result
+
+
+def resolve_skin_anatomy_intersections(
+        positions, skin_indices, backend,
+        skin_mesh=None, neighbors=None, normals=None, skin_topology=None,
+        min_clearance=0.8, clearance_tolerance=DEFAULT_CLEARANCE_TOLERANCE,
+        max_intersection_repair_iterations=DEFAULT_MAX_INTERSECTION_REPAIR_ITERATIONS,
+        intersection_repair_step_ratio=DEFAULT_INTERSECTION_REPAIR_STEP_RATIO,
+        intersection_repair_growth_rings=0,
+        boundary_buffer_rings=1,
+        intersection_tolerance=DEFAULT_INTERSECTION_TOLERANCE,
+        repair_classes=AUTO_REPAIR_INTERSECTION_CLASSES,
+        binary_search_min_step=True,
+        verbose=True,
+        repair_mode=DEFAULT_REPAIR_MODE,
+        repair_blend_rings=DEFAULT_REPAIR_BLEND_RINGS,
+        repair_ring_weights=DEFAULT_REPAIR_RING_WEIGHTS,
+        repair_binary_search=True,
+        repair_binary_search_steps=DEFAULT_REPAIR_BINARY_SEARCH_STEPS,
+        max_surface_repair_passes=None,
+        max_repair_displacement_ratio=DEFAULT_MAX_REPAIR_DISPLACEMENT_RATIO,
+        post_repair_relax=True,
+        post_repair_relax_iterations=3,
+        post_repair_relax_strength=0.1,
+        clearance_policy="preserve_valid_baseline",
+        repair_position_tolerance=None,
+        select_repair_patch=False):
+    """Repair skin/anatomy *surface intersections* (not vertex penetration).
+
+    Uses the EXISTING intersection analyzer as a black box. Default
+    ``repair_mode="anatomy_supported_patch"`` (V2). Pass
+    ``repair_mode="legacy_normal_push"`` to reproduce the V1 per-vertex
+    normal-escape behaviour (spike-prone, kept for A/B).
+    """
+    mode = repair_mode or DEFAULT_REPAIR_MODE
+    if mode in ("legacy_normal_push", "legacy", "v1"):
+        result = _legacy_normal_push_intersection_repair(
+            positions, skin_indices, backend, skin_mesh=skin_mesh,
+            neighbors=neighbors, normals=normals, skin_topology=skin_topology,
+            min_clearance=min_clearance, clearance_tolerance=clearance_tolerance,
+            max_intersection_repair_iterations=max_intersection_repair_iterations,
+            intersection_repair_step_ratio=intersection_repair_step_ratio,
+            intersection_repair_growth_rings=intersection_repair_growth_rings,
+            boundary_buffer_rings=boundary_buffer_rings,
+            intersection_tolerance=intersection_tolerance,
+            repair_classes=repair_classes,
+            binary_search_min_step=binary_search_min_step, verbose=verbose)
+        if select_repair_patch and skin_mesh:
+            select_surface_repair_patch(result, skin_mesh, which="core")
+        return result
+    if mode not in ("anatomy_supported_patch", "v2", "patch"):
+        raise ValueError("repair_mode must be 'anatomy_supported_patch' or "
+                         "'legacy_normal_push', got {0!r}".format(mode))
+    passes = (max_surface_repair_passes if max_surface_repair_passes is not None
+              else DEFAULT_MAX_SURFACE_REPAIR_PASSES)
+    result = _anatomy_supported_patch_repair(
+        positions, skin_indices, backend, skin_mesh=skin_mesh,
+        neighbors=neighbors, normals=normals, skin_topology=skin_topology,
+        min_clearance=min_clearance, clearance_tolerance=clearance_tolerance,
+        clearance_policy=clearance_policy,
+        boundary_buffer_rings=boundary_buffer_rings,
+        intersection_tolerance=intersection_tolerance,
+        repair_blend_rings=repair_blend_rings,
+        repair_ring_weights=repair_ring_weights,
+        repair_binary_search=repair_binary_search,
+        repair_binary_search_steps=repair_binary_search_steps,
+        max_surface_repair_passes=passes,
+        max_repair_displacement_ratio=max_repair_displacement_ratio,
+        post_repair_relax=post_repair_relax,
+        post_repair_relax_iterations=post_repair_relax_iterations,
+        post_repair_relax_strength=post_repair_relax_strength,
+        repair_position_tolerance=repair_position_tolerance,
+        verbose=verbose)
+    if select_repair_patch and skin_mesh:
+        select_surface_repair_patch(result, skin_mesh, which="patch")
     return result
 
 
 repair_skin_anatomy_intersections = resolve_skin_anatomy_intersections
+
+
+def select_surface_repair_patch(report, mesh_name, which="patch", replace=True):
+    """Select V2 repair core or blended patch (SKIN components only)."""
+    if which == "core":
+        idx = report.get("core_vertices") or []
+    elif which == "both":
+        idx = sorted(set(report.get("core_vertices") or [])
+                     | set(report.get("patch_vertices") or []))
+    else:
+        idx = report.get("patch_vertices") or report.get("intersection_vertices_moved") or []
+    if not idx:
+        print("[intersection-repair] no patch vertices to select")
+        return []
+    select_vertices(mesh_name, idx, replace=replace)
+    print("[intersection-repair] selected {0} SKIN verts ({1})".format(len(idx), which))
+    return list(idx)
+
+
+def debug_surface_repair_vertex(vertex_index, repair_report, verbose=True):
+    """Print V2 per-vertex support / target / displacement from a repair report."""
+    info = (repair_report or {}).get("per_vertex") or {}
+    rec = info.get(vertex_index)
+    weights = (repair_report or {}).get("patch_weights") or {}
+    after = (repair_report or {}).get("report_after") or {}
+    remaining_verts = set(after.get("intersecting_skin_vertices") or [])
+    remaining_faces = after.get("intersecting_skin_faces") or []
+    if verbose:
+        print("[debug repair vtx {0}]".format(vertex_index))
+        print("  in core?  {0}  patch weight={1}".format(
+            vertex_index in ((repair_report or {}).get("core_vertices") or []),
+            weights.get(vertex_index)))
+        print("  remaining intersecting vertex? {0}".format(
+            vertex_index in remaining_verts))
+        print("  remaining intersecting faces  = {0}".format(remaining_faces))
+        if not rec:
+            print("  (no per-vertex V2 record; vertex was not a core this pass)")
+            return rec
+        print("  skin position    = {0}".format(rec.get("skin_position")))
+        print("  skin normal      = {0}".format(rec.get("skin_normal")))
+        print("  offending meshes = {0}".format(rec.get("offending_meshes")))
+        print("  candidate supports:")
+        for c in rec.get("candidate_supports") or []:
+            print("    mesh={0} source={1} method={2} n={3}".format(
+                c.get("mesh"), c.get("source"), c.get("method"), c.get("normal")))
+        print("  support method   = {0}".format(rec.get("support_method")))
+        print("  chosen support n = {0}".format(rec.get("support_normal")))
+        print("  closest          = {0}".format(rec.get("closest")))
+        print("  target           = {0}".format(rec.get("target")))
+        print("  target distance  = {0:.5f}".format(rec.get("target_distance") or 0.0))
+        print("  binary-search a  = {0}  final={1}".format(
+            rec.get("binary_search_alpha"), rec.get("final_position")))
+        print("  local edge       = {0:.5f}  offset={1:.5f}".format(
+            rec.get("local_edge") or 0.0, rec.get("offset") or 0.0))
+        print("  applied disp     = {0}".format(rec.get("applied_displacement")))
+    return rec
 
 
 def prepare_skin_region_for_smoothing(
@@ -1988,7 +2809,15 @@ def prepare_skin_region_for_smoothing(
         intersection_repair_growth_rings=0,
         penetration_repair_feather_rings=0,
         boundary_buffer_rings=1,
-        verbose=True):
+        verbose=True,
+        repair_mode=DEFAULT_REPAIR_MODE,
+        repair_blend_rings=DEFAULT_REPAIR_BLEND_RINGS,
+        repair_ring_weights=DEFAULT_REPAIR_RING_WEIGHTS,
+        repair_binary_search=True,
+        max_surface_repair_passes=None,
+        max_repair_displacement_ratio=DEFAULT_MAX_REPAIR_DISPLACEMENT_RATIO,
+        post_repair_relax=True,
+        clearance_policy="preserve_valid_baseline"):
     """Combined pre-repair: vertex penetration then remaining surface crossings.
 
     Recommended order (this function)::
@@ -2022,7 +2851,14 @@ def prepare_skin_region_for_smoothing(
         max_intersection_repair_iterations=max_intersection_repair_iterations,
         intersection_repair_step_ratio=intersection_repair_step_ratio,
         intersection_repair_growth_rings=intersection_repair_growth_rings,
-        boundary_buffer_rings=boundary_buffer_rings, verbose=verbose)
+        boundary_buffer_rings=boundary_buffer_rings, verbose=verbose,
+        repair_mode=repair_mode, repair_blend_rings=repair_blend_rings,
+        repair_ring_weights=repair_ring_weights,
+        repair_binary_search=repair_binary_search,
+        max_surface_repair_passes=max_surface_repair_passes,
+        max_repair_displacement_ratio=max_repair_displacement_ratio,
+        post_repair_relax=post_repair_relax,
+        clearance_policy=clearance_policy)
     work = isect_repair["positions"]
     isect1 = isect_repair.get("report_after") or analyze_skin_anatomy_intersections(
         skin_mesh, skin_indices=skin_indices, backend=backend, positions=work,

@@ -3190,7 +3190,14 @@ def constrained_smooth_m5_region(indices, method="laplacian", strength=0.2,
                                  max_intersection_repair_iterations=20,
                                  intersection_repair_step_ratio=0.10,
                                  intersection_repair_growth_rings=0,
-                                 boundary_buffer_rings=1):
+                                 boundary_buffer_rings=1,
+                                 repair_mode="anatomy_supported_patch",
+                                 repair_blend_rings=2,
+                                 repair_ring_weights=(1.0, 0.6, 0.3),
+                                 repair_binary_search=True,
+                                 max_surface_repair_passes=5,
+                                 max_repair_displacement_ratio=1.0,
+                                 post_repair_relax=False):
     """ANATOMY-CONSTRAINED smoothing of an M5 region (keeps skin above anatomy).
 
     Additive counterpart to :func:`smooth_m5_region`. Default solver is the
@@ -3258,7 +3265,14 @@ def constrained_smooth_m5_region(indices, method="laplacian", strength=0.2,
             max_intersection_repair_iterations=max_intersection_repair_iterations,
             intersection_repair_step_ratio=intersection_repair_step_ratio,
             intersection_repair_growth_rings=intersection_repair_growth_rings,
-            boundary_buffer_rings=boundary_buffer_rings)
+            boundary_buffer_rings=boundary_buffer_rings,
+            repair_mode=repair_mode,
+            repair_blend_rings=repair_blend_rings,
+            repair_ring_weights=repair_ring_weights,
+            repair_binary_search=repair_binary_search,
+            max_surface_repair_passes=max_surface_repair_passes,
+            max_repair_displacement_ratio=max_repair_displacement_ratio,
+            post_repair_relax=post_repair_relax)
     finally:
         if opened:
             try:
@@ -3486,18 +3500,81 @@ def select_intersecting_skin_vertices(report, mesh_name=None):
     return anatomy_constraint.select_intersecting_skin_vertices(report, mesh_name)
 
 
+def select_surface_repair_patch(report, mesh_name=None, which="patch"):
+    """Select V2 repair core or blended patch (SKIN vertices only, not anatomy)."""
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    if not report:
+        print("[M5] no repair report")
+        return []
+    return anatomy_constraint.select_surface_repair_patch(
+        report, mesh_name, which=which)
+
+
+def print_intersection_repair_metrics(repair, label=""):
+    """Print V1/V2 intersection-repair metrics from a resolve report."""
+    if not repair:
+        print("[M5] no repair report")
+        return
+    prefix = "[repair{0}]".format(" " + label if label else "")
+    print("{0} mode={1} passes={2}".format(
+        prefix, repair.get("repair_mode"), repair.get("repair_passes")))
+    print("  faces {0} -> {1}   pairs {2} -> {3}".format(
+        repair.get("intersecting_faces_before"),
+        repair.get("intersecting_faces_after"),
+        repair.get("intersection_pairs_before"),
+        repair.get("intersection_pairs_after")))
+    print("  core={0} patch={1}  anatomy={2}".format(
+        repair.get("core_vertex_count"), repair.get("patch_vertex_count"),
+        repair.get("offending_anatomy_meshes")))
+    print("  mean/max displacement = {0:.5f} / {1:.5f}".format(
+        float(repair.get("mean_applied_displacement") or 0.0),
+        float(repair.get("max_applied_displacement") or 0.0)))
+    print("  mean/max disp gradient = {0:.5f} / {1:.5f}".format(
+        float(repair.get("mean_displacement_gradient") or 0.0),
+        float(repair.get("max_displacement_gradient") or 0.0)))
+    print("  unresolved faces={0}  unresolved core={1}  binary_searches={2}".format(
+        repair.get("intersection_faces_unresolved"),
+        len(repair.get("unresolved_core_vertices") or []),
+        repair.get("binary_search_count")))
+    print("  post_relax_disp={0}  runtime={1}".format(
+        repair.get("post_relax_displacement"),
+        repair.get("runtime_seconds")))
+
+
+def debug_surface_repair_vertex(vertex_index, repair_report):
+    """Print V2 support/target/displacement for one core vertex."""
+    if not _helpers_ready():
+        return
+    return anatomy_constraint.debug_surface_repair_vertex(
+        vertex_index, repair_report, verbose=True)
+
+
 def resolve_m5_region_intersections(indices, mesh_name=None, anatomical_meshes=None,
                                     apply=True, verbose=True, create_backup=True,
                                     min_clearance=None,
                                     max_intersection_repair_iterations=20,
                                     intersection_repair_step_ratio=0.10,
                                     intersection_repair_growth_rings=0,
-                                    boundary_buffer_rings=1):
+                                    boundary_buffer_rings=1,
+                                    repair_mode="anatomy_supported_patch",
+                                    repair_blend_rings=2,
+                                    repair_ring_weights=(1.0, 0.6, 0.3),
+                                    repair_binary_search=True,
+                                    repair_binary_search_steps=8,
+                                    max_surface_repair_passes=5,
+                                    max_repair_displacement_ratio=1.0,
+                                    post_repair_relax=True,
+                                    post_repair_relax_iterations=3,
+                                    post_repair_relax_strength=0.1,
+                                    select_repair_patch=False):
     """SURFACE-INTERSECTION pre-repair ONLY (no Laplacian).
 
-    Pushes intersecting skin vertices outward along skin normals until
-    triangle-triangle crossings are gone or max iterations is reached.
-    One undo chunk. Does not move whole-skin vertices outside ``indices``.
+    Default ``repair_mode="anatomy_supported_patch"`` (V2). Pass
+    ``repair_mode="legacy_normal_push"`` to reproduce the spike-prone V1
+    per-vertex normal escape. One undo chunk. Does not move vertices outside
+    ``indices`` plus optional repair blend rings. Detector is unchanged.
     """
     if not _helpers_ready():
         return
@@ -3535,7 +3612,17 @@ def resolve_m5_region_intersections(indices, mesh_name=None, anatomical_meshes=N
             max_intersection_repair_iterations=max_intersection_repair_iterations,
             intersection_repair_step_ratio=intersection_repair_step_ratio,
             intersection_repair_growth_rings=intersection_repair_growth_rings,
-            boundary_buffer_rings=boundary_buffer_rings, verbose=verbose)
+            boundary_buffer_rings=boundary_buffer_rings, verbose=verbose,
+            repair_mode=repair_mode, repair_blend_rings=repair_blend_rings,
+            repair_ring_weights=repair_ring_weights,
+            repair_binary_search=repair_binary_search,
+            repair_binary_search_steps=repair_binary_search_steps,
+            max_surface_repair_passes=max_surface_repair_passes,
+            max_repair_displacement_ratio=max_repair_displacement_ratio,
+            post_repair_relax=post_repair_relax,
+            post_repair_relax_iterations=post_repair_relax_iterations,
+            post_repair_relax_strength=post_repair_relax_strength,
+            select_repair_patch=select_repair_patch)
         if apply:
             mesh_utils.set_mesh_vertices(mesh_name, repair["positions"])
     finally:
@@ -3760,7 +3847,10 @@ if HELPERS_AVAILABLE:
     print("  analyze_m5_region_intersections(fixed_region)         - skin FACE vs anatomy FACE (protrusion)")
     print("  select_intersecting_skin_faces(report)                - select intersecting SKIN faces")
     print("  select_intersecting_skin_vertices(report)             - select verts of intersecting faces")
-    print("  resolve_m5_region_intersections(fixed_region)         - outward repair of surface crossings")
+    print("  resolve_m5_region_intersections(fixed_region)         - V2 anatomy-supported patch repair (default)")
+    print("  select_surface_repair_patch(repair)                   - select V2 core/patch SKIN verts")
+    print("  print_intersection_repair_metrics(repair)             - faces/disp/gradient after repair")
+    print("  debug_surface_repair_vertex(i, repair)                - diagnose one V2 repair vertex")
     print("  repair_m5_region_anatomy_conflicts(fixed_region)      - combined vertex+surface pre-repair")
     print("  debug_skin_anatomy_intersection(face_id)              - diagnose one intersecting skin face")
     print("  select_penetrating_skin_vertices(report)              - select penetrating SKIN verts")

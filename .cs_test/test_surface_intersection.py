@@ -162,7 +162,9 @@ repair = ac.resolve_skin_anatomy_intersections(
     neighbors=neighbors, normals=normals, skin_topology=skin_topo,
     min_clearance=None, boundary_buffer_rings=0,
     max_intersection_repair_iterations=20,
-    intersection_repair_step_ratio=0.5, verbose=False)
+    intersection_repair_step_ratio=0.5, verbose=False,
+    repair_mode="legacy_normal_push")
+check("legacy V1 repair_mode", repair["repair_mode"] == "legacy_normal_push")
 check("repair moved some verts",
       len(repair["intersection_vertices_moved"]) > 0)
 check("repair reduced or cleared faces",
@@ -173,6 +175,8 @@ check("repair reduced or cleared faces",
 check("faces after repair ideally 0",
       repair["report_after"]["intersecting_skin_face_count"] == 0,
       str(repair["report_after"]["intersecting_skin_face_count"]))
+check("V1 reports displacement gradient",
+      "max_displacement_gradient" in repair)
 
 print("8. combined prepare keeps penetration API working")
 # Plane-like: no intersection soup, vertex likely-penetrating
@@ -255,6 +259,88 @@ m_leg = smoothing_utils.constrained_smooth_mesh_region(
     prevent_segment_crossing=False, preserve_tangential=False,
     clearance_policy="global", apply=False, verbose=False)
 check("legacy solver still works", m_leg["constraint_solver"] == "legacy_single_push")
+
+print("11. V2 anatomy-supported patch repair (default)")
+pts11 = [list(p) for p in skin_pts] + [[10.0, 10.0, 10.0]]
+nbrs11 = [[1, 2], [0, 2], [0, 1], []]
+nrms11 = [[0, 0, 1], [0, 0, 1], [0, 0, 1], [0, 0, 1]]
+topo11 = _skin_topo([(0, 0, 1, 2)], 4)
+v2 = ac.resolve_skin_anatomy_intersections(
+    pts11, [0, 1, 2], backend,
+    neighbors=nbrs11, normals=nrms11, skin_topology=topo11,
+    min_clearance=None, boundary_buffer_rings=0,
+    repair_mode="anatomy_supported_patch",
+    repair_blend_rings=2, repair_ring_weights=(1.0, 0.6, 0.3),
+    repair_binary_search=True, max_surface_repair_passes=5,
+    max_repair_displacement_ratio=1.0, post_repair_relax=False,
+    verbose=False)
+check("V2 default mode name", v2["repair_mode"] == "anatomy_supported_patch")
+check("V2 clears intersecting faces",
+      v2["intersecting_faces_after"] == 0,
+      str(v2["intersecting_faces_after"]))
+check("V2 core count > 0", v2["core_vertex_count"] > 0)
+check("V2 patch count >= core",
+      v2["patch_vertex_count"] >= v2["core_vertex_count"])
+check("V2 far vertex 3 unmoved",
+      abs(v2["positions"][3][0] - 10.0) < 1e-12
+      and abs(v2["positions"][3][1] - 10.0) < 1e-12
+      and abs(v2["positions"][3][2] - 10.0) < 1e-12)
+check("V2 has gradient metrics",
+      v2["max_displacement_gradient"] >= 0.0)
+check("V2 binary_search_count recorded",
+      v2.get("binary_search_count", 0) >= 0)
+# Diverging normals: V1 spikes, V2 should be more coherent.
+nrms_div = [[1, 0, 0], [0, 0, 1], [-1, 0, 0]]
+v1_div = ac.resolve_skin_anatomy_intersections(
+    [list(p) for p in skin_pts], [0, 1, 2], backend,
+    neighbors=neighbors, normals=nrms_div, skin_topology=skin_topo,
+    min_clearance=None, boundary_buffer_rings=0,
+    repair_mode="legacy_normal_push",
+    max_intersection_repair_iterations=20,
+    intersection_repair_step_ratio=0.5, verbose=False)
+v2_div = ac.resolve_skin_anatomy_intersections(
+    [list(p) for p in skin_pts], [0, 1, 2], backend,
+    neighbors=neighbors, normals=nrms_div, skin_topology=skin_topo,
+    min_clearance=None, boundary_buffer_rings=0,
+    repair_mode="anatomy_supported_patch", post_repair_relax=False,
+    verbose=False)
+check("V2 still clears with diverging normals",
+      v2_div["intersecting_faces_after"] == 0,
+      str(v2_div["intersecting_faces_after"]))
+check("V2 max gradient << V1 spike gradient",
+      v2_div["max_displacement_gradient"] < v1_div["max_displacement_gradient"]
+      or v1_div["max_displacement_gradient"] == 0.0,
+      "v2={0} v1={1}".format(
+          v2_div["max_displacement_gradient"],
+          v1_div["max_displacement_gradient"]))
+
+print("12. support-normal orientation + patch helpers")
+n_ok, method_ok = ac._orient_support_normal([0, -1, 0], [0, 0, 1])
+check("degenerate-dot keeps anatomy (dot=0)", method_ok == "oriented_anatomy")
+n_flip, method_flip = ac._orient_support_normal([0, 0, -1], [0, 0, 1])
+check("opposing anatomy normal is flipped",
+      method_flip == "oriented_anatomy" and n_flip[2] > 0.0)
+n_fb, method_fb = ac._orient_support_normal([0, 0, 0], [0, 1, 0])
+check("degenerate anatomy falls back to skin",
+      method_fb == "skin_fallback" and abs(n_fb[1] - 1.0) < 1e-8)
+patch = ac._build_intersection_repair_patch(
+    [1], [[0, 1], [0, 2], [1]], allowed={0, 1, 2}, boundary=set(),
+    blend_rings=2, ring_weights=(1.0, 0.6, 0.3))
+check("core weight 1.0", abs(patch["weights"][1] - 1.0) < 1e-12)
+check("outer ring present or core-only on tiny mesh",
+      1 in patch["core"] and 1 in patch["patch"])
+
+print("13. analyzer behaviour is unchanged (identification freeze)")
+rep13 = ac.analyze_skin_anatomy_intersections(
+    None, skin_indices=[0, 1, 2], backend=backend, positions=skin_pts,
+    skin_topology=skin_topo, boundary_buffer_rings=0, exclude_boundary_faces=False,
+    detailed=True, verbose=False)
+check("analyzer still reports details records",
+      isinstance(rep13.get("details"), list) and len(rep13["details"]) >= 1)
+check("analyzer detail has anatomy_mesh",
+      "anatomy_mesh" in rep13["details"][0])
+check("analyzer does not repair",
+      "repair_mode" not in rep13)
 
 if fails:
     print("\nFAILED {0}: {1}".format(len(fails), fails))
