@@ -47,6 +47,17 @@ def vec_scale(v, s):
     return [v[0] * s, v[1] * s, v[2] * s]
 
 
+def vec_dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def vec_normalize(v):
+    n = vec_length(v)
+    if n < 1e-12:
+        return [0.0, 0.0, 0.0]
+    return [v[0] / n, v[1] / n, v[2] / n]
+
+
 def vec_mean(vectors):
     n = len(vectors)
     if n == 0:
@@ -373,3 +384,48 @@ def closest_point_on_mesh(mesh_fn, point):
         return [cp.x, cp.y, cp.z], dist
     except Exception:
         return list(point), float("inf")
+
+
+def closest_point_and_normal(mesh_fn, point):
+    """Return ``(closest_xyz, distance, face_normal, face_id)``.
+
+    Uses Maya API 2.0 ``getClosestPointAndNormal`` when available, otherwise
+    ``getClosestPoint`` + ``getPolygonNormal``. The normal is the closest-face
+    polygon normal in world space (not a blended vertex normal). On failure
+    returns ``(point, inf, [0,0,1], -1)``. Distances remain UNSIGNED.
+    """
+    fallback_n = [0.0, 0.0, 1.0]
+    if not MAYA_AVAILABLE or mesh_fn is None:
+        return list(point), float("inf"), fallback_n, -1
+    try:
+        qp = om.MPoint(point[0], point[1], point[2])
+        face_id = -1
+        cp = None
+        normal = None
+        if hasattr(mesh_fn, "getClosestPointAndNormal"):
+            try:
+                cp, nvec, face_id = mesh_fn.getClosestPointAndNormal(qp, om.MSpace.kWorld)
+                normal = [nvec.x, nvec.y, nvec.z]
+            except Exception:
+                cp, nvec, face_id = None, None, -1
+        if cp is None:
+            cp, face_id = mesh_fn.getClosestPoint(qp, om.MSpace.kWorld)
+            try:
+                nvec = mesh_fn.getPolygonNormal(face_id, om.MSpace.kWorld)
+                normal = [nvec.x, nvec.y, nvec.z]
+            except Exception:
+                normal = fallback_n
+        dist = math.sqrt((point[0] - cp.x) ** 2
+                         + (point[1] - cp.y) ** 2
+                         + (point[2] - cp.z) ** 2)
+        ln = math.sqrt(normal[0] ** 2 + normal[1] ** 2 + normal[2] ** 2)
+        if ln < 1e-12:
+            to_p = [point[0] - cp.x, point[1] - cp.y, point[2] - cp.z]
+            ln2 = math.sqrt(to_p[0] ** 2 + to_p[1] ** 2 + to_p[2] ** 2)
+            normal = ([to_p[0] / ln2, to_p[1] / ln2, to_p[2] / ln2]
+                      if ln2 > 1e-12 else fallback_n)
+        else:
+            normal = [normal[0] / ln, normal[1] / ln, normal[2] / ln]
+        return [cp.x, cp.y, cp.z], dist, normal, int(face_id)
+    except Exception:
+        return list(point), float("inf"), fallback_n, -1

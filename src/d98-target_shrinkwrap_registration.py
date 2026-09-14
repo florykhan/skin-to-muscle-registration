@@ -48,7 +48,8 @@ except ImportError:
 # OPTIONAL HELPER MODULES (post-registration cleanup toolkit)
 # =============================================================================
 # The reusable cleanup helpers live in the SAME src/ folder as this file:
-#   mesh_utils, smoothing_utils, region_selection, metrics_utils, maya_io
+#   mesh_utils, anatomy_constraint, smoothing_utils, region_selection,
+#   metrics_utils, maya_io, artifact_detection, cleanup_pipeline
 #
 # IMPORTANT (why auto-detect from __file__ does NOT work):
 # The MayaCode VS Code extension does not run this file in place. It copies the
@@ -74,16 +75,17 @@ HELPER_SRC_DIR = r"/Users/florykhan/Documents/Projects/Research Projects/skin-to
 HELPER_DEBUG = True
 
 # Order matters: modules that import siblings must come AFTER them.
-# artifact_detection imports mesh_utils + region_selection; cleanup_pipeline
-# imports artifact_detection + smoothing_utils + metrics_utils + maya_io, so it
-# is loaded last.
-HELPER_MODULES = ("mesh_utils", "smoothing_utils", "region_selection",
-                  "metrics_utils", "maya_io", "artifact_detection",
-                  "cleanup_pipeline")
+# artifact_detection imports mesh_utils + region_selection; smoothing_utils
+# imports anatomy_constraint; cleanup_pipeline imports artifact_detection +
+# smoothing_utils + metrics_utils + maya_io, so it is loaded last.
+HELPER_MODULES = ("mesh_utils", "anatomy_constraint", "smoothing_utils",
+                  "region_selection", "metrics_utils", "maya_io",
+                  "artifact_detection", "cleanup_pipeline")
 HELPERS_AVAILABLE = False
 
 # Placeholders so these names always exist (reassigned to real modules on load).
 mesh_utils = None
+anatomy_constraint = None
 smoothing_utils = None
 region_selection = None
 metrics_utils = None
@@ -3142,28 +3144,56 @@ def _make_anatomy_sdf_query(mesh_fns):
     return _q
 
 
+def _make_anatomy_backend(anatomical_meshes=None):
+    """MayaAnatomyBackend over cached INTERNAL_MESHES MFnMesh handles + SDF query."""
+    mesh_fns = _get_anatomy_mesh_fns(anatomical_meshes)
+    if not mesh_fns:
+        return None, None
+    sdf_query_fn = _make_anatomy_sdf_query(mesh_fns)
+    backend = anatomy_constraint.MayaAnatomyBackend(mesh_fns, sdf_query_fn=sdf_query_fn)
+    return backend, sdf_query_fn
+
+
+def _default_min_clearance(min_clearance, target_offset=None):
+    if min_clearance is not None:
+        return min_clearance
+    sw = REG_DATA.get('shrinkwrap_params')
+    value = (sw.collision_min_distance if sw is not None
+             else ShrinkwrapParams().collision_min_distance)
+    if target_offset is not None:
+        print("[M5] note: target_offset provided but NOT used as an exact "
+              "distance; enforcing collision_min_distance={0} as the anatomy "
+              "floor. Pass min_clearance=<value> to override.".format(value))
+    return value
+
+
 def constrained_smooth_m5_region(indices, method="laplacian", strength=0.2,
                                  iterations=20, min_clearance=None,
                                  target_offset=None, constraint_interval=1,
                                  boundary_feather_rings=0, max_step_edge_ratio=None,
                                  anatomical_meshes=None, mesh_name=None,
                                  create_backup=True, apply=True, verbose=True,
-                                 report_interval=10, verbose_iterations=False):
+                                 report_interval=10, verbose_iterations=False,
+                                 resolve_initial_penetration=True,
+                                 penetration_mode="auto",
+                                 clearance_policy="preserve_valid_baseline",
+                                 max_constraint_iterations=8,
+                                 max_escape_iterations=10,
+                                 clearance_tolerance=1e-4,
+                                 prevent_segment_crossing=True,
+                                 penetration_repair_feather_rings=0,
+                                 constraint_solver="iterative_exact",
+                                 preserve_tangential=True):
     """ANATOMY-CONSTRAINED smoothing of an M5 region (keeps skin above anatomy).
 
-    New, additive counterpart to :func:`smooth_m5_region`: same localized smoothing
-    motion, but after every smoothing step it enforces the registration's own
-    anatomical FLOOR -- vertices closer to internal anatomy than ``min_clearance``
-    are pushed back out using ``compute_sdf_for_point`` (closest point +
-    outward*clearance), exactly like the registration collision pass. Inward
-    flattening of bumps is allowed; collapsing through fat/muscle/bone is not.
-
-    ``min_clearance`` defaults to the registration's ``collision_min_distance``
-    (the existing anatomy-safe threshold). ``target_offset``/D0 is NOT an exact
-    snapping distance (skin-to-tissue distance varies across the face); it is
-    accepted for compatibility but ignored for the floor unless you explicitly pass
-    ``min_clearance=<value>``. The unconstrained :func:`smooth_m5_region` is left
-    untouched for A/B comparison. Returns the metrics dict.
+    Additive counterpart to :func:`smooth_m5_region`. Default solver is the
+    iterative exact-distance projector (``constraint_solver="iterative_exact"``)
+    with optional penetration pre-repair. Pass
+    ``constraint_solver="legacy_single_push"`` plus
+    ``resolve_initial_penetration=False, prevent_segment_crossing=False,
+    preserve_tangential=False, clearance_policy="global"`` to reproduce the
+    historical one-shot smooth-min push. ``smooth_m5_region`` is unchanged.
+    Pre-repair + smoothing share ONE Maya undo chunk. One optional backup.
     """
     if not _helpers_ready():
         return
@@ -3175,21 +3205,11 @@ def constrained_smooth_m5_region(indices, method="laplacian", strength=0.2,
         print("[M5] no vertices to smooth (empty M5 region).")
         return
 
-    mesh_fns = _get_anatomy_mesh_fns(anatomical_meshes)
-    if not mesh_fns:
+    backend, sdf_query_fn = _make_anatomy_backend(anatomical_meshes)
+    if backend is None:
         print("[M5] no anatomy meshes found; cannot constrain. Check INTERNAL_MESHES.")
         return
-
-    if min_clearance is None:
-        sw = REG_DATA.get('shrinkwrap_params')
-        min_clearance = (sw.collision_min_distance if sw is not None
-                         else ShrinkwrapParams().collision_min_distance)
-        if target_offset is not None:
-            print("[M5] note: target_offset provided but NOT used as an exact "
-                  "distance; enforcing collision_min_distance={0} as the anatomy "
-                  "floor. Pass min_clearance=<value> to override.".format(min_clearance))
-
-    sdf_query_fn = _make_anatomy_sdf_query(mesh_fns)
+    min_clearance = _default_min_clearance(min_clearance, target_offset)
 
     if create_backup and apply:
         bk = mesh_name + "_preconstrainedsmooth"
@@ -3212,7 +3232,18 @@ def constrained_smooth_m5_region(indices, method="laplacian", strength=0.2,
             boundary_feather_rings=boundary_feather_rings,
             max_step_edge_ratio=max_step_edge_ratio,
             apply=apply, verbose=verbose, report_interval=report_interval,
-            verbose_iterations=verbose_iterations)
+            verbose_iterations=verbose_iterations,
+            anatomy_backend=backend,
+            constraint_solver=constraint_solver,
+            resolve_initial_penetration=resolve_initial_penetration,
+            penetration_mode=penetration_mode,
+            clearance_policy=clearance_policy,
+            max_constraint_iterations=max_constraint_iterations,
+            max_escape_iterations=max_escape_iterations,
+            clearance_tolerance=clearance_tolerance,
+            prevent_segment_crossing=prevent_segment_crossing,
+            penetration_repair_feather_rings=penetration_repair_feather_rings,
+            preserve_tangential=preserve_tangential)
     finally:
         if opened:
             try:
@@ -3220,7 +3251,7 @@ def constrained_smooth_m5_region(indices, method="laplacian", strength=0.2,
             except Exception:
                 pass
     if isinstance(metrics, dict):
-        metrics["anatomy_mesh_count"] = len(mesh_fns)
+        metrics["anatomy_mesh_count"] = len(backend.mesh_fns)
     return metrics
 
 
@@ -3264,6 +3295,171 @@ def debug_anatomy_constraint_vertex(vertex_index, proposed_position=None,
     return {"vertex": vertex_index, "distance": sdf_val, "min_clearance": min_clearance,
             "nearest_mesh": mesh, "closest_point": cp, "outward": outward,
             "constrained": constrained, "corrected_position": safe}
+
+
+def analyze_m5_region_penetration(indices, min_clearance=None, mesh_name=None,
+                                  anatomical_meshes=None, detailed=False,
+                                  verbose=True, select=False):
+    """Analyze SKIN vertices in an M5 region vs fat/muscle/bone geometry.
+
+    Yellow fat / red muscle in the viewport are NOT the selection -- this
+    classifies gray-skin vertices. Unsigned distance below clearance is
+    reported separately from actual/likely penetration.
+    """
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    if isinstance(indices, dict):
+        indices = indices.get("final_indices", [])
+    indices = list(indices)
+    backend, _sdf = _make_anatomy_backend(anatomical_meshes)
+    if backend is None:
+        print("[M5] no anatomy meshes found")
+        return
+    min_clearance = _default_min_clearance(min_clearance)
+    report = anatomy_constraint.analyze_skin_anatomy_penetration(
+        mesh_name, indices=indices, min_clearance=min_clearance,
+        backend=backend, detailed=detailed, verbose=verbose)
+    if select:
+        select_penetrating_skin_vertices(report, mesh_name=mesh_name)
+    return report
+
+
+def select_penetrating_skin_vertices(report, mesh_name=None, include_likely=True,
+                                     include_unknown=False):
+    """Select classified penetrating SKIN vertices in Maya (not fat/muscle)."""
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    if not report:
+        print("[M5] no penetration report")
+        return []
+    return anatomy_constraint.select_penetrating_skin_vertices(
+        report, mesh_name, include_likely=include_likely,
+        include_unknown=include_unknown)
+
+
+def resolve_m5_region_penetrations(indices, min_clearance=None, mesh_name=None,
+                                   anatomical_meshes=None, apply=True,
+                                   verbose=True, create_backup=True,
+                                   max_escape_iterations=10,
+                                   penetration_repair_feather_rings=0,
+                                   clearance_tolerance=1e-4):
+    """PRE-REPAIR ONLY: push high-confidence penetrating skin vertices out.
+
+    Does not run Laplacian smoothing. One undo chunk. ``unknown`` vertices are
+    not moved. Returns the repair dict plus before/after penetration reports.
+    """
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    if isinstance(indices, dict):
+        indices = indices.get("final_indices", [])
+    indices = list(indices)
+    if not indices:
+        print("[M5] no vertices to repair")
+        return
+    backend, _sdf = _make_anatomy_backend(anatomical_meshes)
+    if backend is None:
+        print("[M5] no anatomy meshes found")
+        return
+    min_clearance = _default_min_clearance(min_clearance)
+    verts = mesh_utils.get_mesh_vertices(mesh_name)
+    normals = mesh_utils.get_vertex_normals(mesh_name)
+    neighbors = mesh_utils.get_vertex_neighbors(mesh_name)
+    before_rep = anatomy_constraint.analyze_skin_anatomy_penetration(
+        mesh_name, indices=indices, min_clearance=min_clearance,
+        backend=backend, positions=verts, normals=normals,
+        detailed=True, verbose=verbose)
+
+    if create_backup and apply:
+        bk = mesh_name + "_prepenetrationrepair"
+        if not cmds.objExists(bk):
+            maya_io.duplicate_mesh(mesh_name, suffix="_prepenetrationrepair")
+
+    opened = False
+    try:
+        cmds.undoInfo(openChunk=True, chunkName="resolve_m5_penetrations")
+        opened = True
+    except Exception:
+        pass
+    try:
+        repair = anatomy_constraint.resolve_skin_anatomy_penetrations(
+            verts, indices, backend, min_clearance=min_clearance,
+            normals=normals, neighbors=neighbors,
+            max_escape_iterations=max_escape_iterations,
+            clearance_tolerance=clearance_tolerance,
+            penetration_repair_feather_rings=penetration_repair_feather_rings,
+            classifications=before_rep.get("details_by_vertex"),
+            verbose=verbose)
+        if apply:
+            mesh_utils.set_mesh_vertices(mesh_name, repair["positions"])
+    finally:
+        if opened:
+            try:
+                cmds.undoInfo(closeChunk=True)
+            except Exception:
+                pass
+
+    after_rep = anatomy_constraint.analyze_skin_anatomy_penetration(
+        mesh_name, indices=indices, min_clearance=min_clearance,
+        backend=backend, positions=repair["positions"], normals=normals,
+        verbose=verbose)
+    repair["report_before"] = before_rep
+    repair["report_after"] = after_rep
+    repair["apply"] = bool(apply)
+    print("[M5] pre-repair only: repaired={0} unresolved={1} "
+          "penetrating {2}->{3} likely {4}->{5}".format(
+              repair["repaired_count"], repair["unresolved_count"],
+              before_rep.get("penetrating_count"), after_rep.get("penetrating_count"),
+              before_rep.get("likely_penetrating_count"),
+              after_rep.get("likely_penetrating_count")))
+    return repair
+
+
+def restore_skin_from_backup(backup_name, mesh_name=None):
+    """Copy world-space vertices from a backup mesh onto the live skin.
+
+    Does not delete anything. ``backup_name`` is typically
+    ``skin_cloth_copy_v5_pull_back_preconstrainedsmooth`` or a dedicated
+    original duplicate.
+    """
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    src = mesh_utils.get_mesh_vertices(backup_name)
+    if not src:
+        print("[M5] backup '{0}' has no vertices / not found".format(backup_name))
+        return False
+    dst_n = mesh_utils.get_vertex_count(mesh_name)
+    if dst_n != len(src):
+        print("[M5] vertex-count mismatch: {0}={1} vs backup={2}".format(
+            mesh_name, dst_n, len(src)))
+        return False
+    mesh_utils.set_mesh_vertices(mesh_name, src)
+    print("[M5] restored '{0}' from '{1}' ({2} verts)".format(
+        mesh_name, backup_name, len(src)))
+    return True
+
+
+def debug_skin_anatomy_vertex(vertex_index, min_clearance=None, mesh_name=None,
+                              anatomical_meshes=None, laplacian_strength=0.2):
+    """Diagnose one skin vertex: exact vs SDF, classification, legacy vs robust."""
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    backend, _sdf = _make_anatomy_backend(anatomical_meshes)
+    if backend is None:
+        print("[M5] no anatomy meshes found")
+        return
+    min_clearance = _default_min_clearance(min_clearance)
+    verts = mesh_utils.get_mesh_vertices(mesh_name)
+    normals = mesh_utils.get_vertex_normals(mesh_name)
+    neighbors = mesh_utils.get_vertex_neighbors(mesh_name)
+    return anatomy_constraint.debug_skin_anatomy_vertex(
+        vertex_index, verts, backend, normals=normals, neighbors=neighbors,
+        min_clearance=min_clearance, laplacian_strength=laplacian_strength,
+        verbose=True)
 
 
 def run_m5_iterative_cleanup(target_offset=None, skin_mesh=None,
@@ -3360,6 +3556,11 @@ if HELPERS_AVAILABLE:
     print("  compare_m3_m4_m5(m5_report)                            - M5 count/overlap comparison (no re-run)")
     print("  smooth_m5_region(m5_idx, iterations=5)                - M5 smooth a detected region (unconstrained)")
     print("  constrained_smooth_m5_region(m5_idx, iterations=20)   - M5 ANATOMY-CONSTRAINED smooth (safe floor)")
+    print("  analyze_m5_region_penetration(fixed_region)           - classify skin vs anatomy (not shaders)")
+    print("  select_penetrating_skin_vertices(report)              - select penetrating SKIN verts")
+    print("  resolve_m5_region_penetrations(fixed_region)          - pre-repair penetrations only")
+    print("  debug_skin_anatomy_vertex(i)                          - diagnose one skin vertex")
+    print("  restore_skin_from_backup(CUR+'_preconstrainedsmooth') - copy verts from a backup mesh")
     print("  run_m5_iterative_cleanup(target_offset=..)            - M5 CLOSED-LOOP detect->smooth->re-detect")
     print("  cleanup_selected_region(strength=0.3, iterations=8)   - smooth viewport selection")
     print("  cleanup_named_region('lips', strength=0.3)            - smooth heuristic region")
