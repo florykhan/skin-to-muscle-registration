@@ -2818,6 +2818,73 @@ def detect_reference_skin_artifacts(current_mesh=None, target_mesh=None,
         rings=rings, select=select, epsilon=epsilon)
 
 
+def detect_multiscale_skin_artifacts(mesh_name=None, scales=(1, 2, 3),
+                                     method="percentile", percentile=97.5,
+                                     threshold=2.5, normalize=True,
+                                     aggregation="persistence",
+                                     min_persistent_scales=2,
+                                     exclude_boundaries=True,
+                                     boundary_buffer_rings=1,
+                                     min_component_size=5,
+                                     final_growth_rings=1, select=True,
+                                     epsilon=1e-8):
+    """M3 (experimental) multi-scale, boundary-aware artifact detection.
+
+    Thin delegate to artifact_detection.detect_multiscale_irregular_region.
+    Enhances M1 by combining Laplacian scores across neighbourhood scales,
+    excluding true topological boundaries, and dropping tiny components.
+    Detection ONLY -- never moves vertices or renames objects. Returns
+    ``(final_indices, report)``.
+    """
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    return artifact_detection.detect_multiscale_irregular_region(
+        mesh_name, scales=scales, method=method, percentile=percentile,
+        threshold=threshold, normalize=normalize, aggregation=aggregation,
+        min_persistent_scales=min_persistent_scales,
+        exclude_boundaries=exclude_boundaries,
+        boundary_buffer_rings=boundary_buffer_rings,
+        min_component_size=min_component_size,
+        final_growth_rings=final_growth_rings, select=select, epsilon=epsilon)
+
+
+def detect_hybrid_skin_artifacts(skin_mesh=None, anatomical_meshes=None,
+                                 method="percentile", percentile=97.5,
+                                 threshold=2.5, laplacian_scales=(1, 2),
+                                 normal_rings=1, distance_rings=2,
+                                 laplacian_weight=0.3, normal_weight=0.2,
+                                 distance_weight=0.5, use_boundary_weights=True,
+                                 boundary_max_rings=3,
+                                 boundary_ring_weights=(0.0, 0.25, 0.6, 1.0),
+                                 min_component_size=3, final_growth_rings=1,
+                                 select=True, epsilon=1e-8):
+    """M3 V2 (experimental) hybrid geometry + anatomy-aware artifact detection.
+
+    Thin delegate to artifact_detection.detect_hybrid_artifacts. Combines
+    multi-scale Laplacian, surface-normal inconsistency, and local
+    distance-to-anatomy deviation (against INTERNAL_MESHES by default), with soft
+    boundary weighting. Detection ONLY -- never moves vertices or renames
+    objects. Returns ``(final_indices, report)``.
+    """
+    if not _helpers_ready():
+        return
+    skin_mesh = skin_mesh or SKIN_MESH
+    if anatomical_meshes is None:
+        anatomical_meshes = INTERNAL_MESHES
+    return artifact_detection.detect_hybrid_artifacts(
+        skin_mesh, anatomical_meshes=anatomical_meshes, method=method,
+        percentile=percentile, threshold=threshold,
+        laplacian_scales=laplacian_scales, normal_rings=normal_rings,
+        distance_rings=distance_rings, laplacian_weight=laplacian_weight,
+        normal_weight=normal_weight, distance_weight=distance_weight,
+        use_boundary_weights=use_boundary_weights,
+        boundary_max_rings=boundary_max_rings,
+        boundary_ring_weights=boundary_ring_weights,
+        min_component_size=min_component_size,
+        final_growth_rings=final_growth_rings, select=select, epsilon=epsilon)
+
+
 def _configure_m4_sdf_backend():
     """Inject THIS script's SDF into artifact_detection so M4 reuses it.
 
@@ -2943,6 +3010,8 @@ if HELPERS_AVAILABLE:
     print("Post-registration cleanup helpers:")
     print("  detect_skin_artifacts(percentile=97.5)                - M1 AUTO-detect irregular verts (no edits)")
     print("  detect_reference_skin_artifacts(percentile=97.5)      - M2 reference-based detect (fewer false +)")
+    print("  detect_multiscale_skin_artifacts()                    - M3 V1 multi-scale boundary-aware (exp.)")
+    print("  detect_hybrid_skin_artifacts()                        - M3 V2 hybrid geo+anatomy detect (exp.)")
     print("  summarize_skin_anatomy_distances()                    - M4 pick target_offset from scene scale")
     print("  detect_sdf_reference_skin_artifacts(target_offset=..) - M4 SDF-reference detect (anatomy-derived)")
     print("  cleanup_selected_region(strength=0.3, iterations=8)   - smooth viewport selection")
