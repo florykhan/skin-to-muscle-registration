@@ -3183,14 +3183,22 @@ def constrained_smooth_m5_region(indices, method="laplacian", strength=0.2,
                                  prevent_segment_crossing=True,
                                  penetration_repair_feather_rings=0,
                                  constraint_solver="iterative_exact",
-                                 preserve_tangential=True):
+                                 preserve_tangential=True,
+                                 resolve_initial_surface_intersections=True,
+                                 prevent_surface_intersections=True,
+                                 surface_intersection_check_interval=1,
+                                 max_intersection_repair_iterations=20,
+                                 intersection_repair_step_ratio=0.10,
+                                 intersection_repair_growth_rings=0,
+                                 boundary_buffer_rings=1):
     """ANATOMY-CONSTRAINED smoothing of an M5 region (keeps skin above anatomy).
 
     Additive counterpart to :func:`smooth_m5_region`. Default solver is the
-    iterative exact-distance projector (``constraint_solver="iterative_exact"``)
-    with optional penetration pre-repair. Pass
-    ``constraint_solver="legacy_single_push"`` plus
-    ``resolve_initial_penetration=False, prevent_segment_crossing=False,
+    iterative exact-distance projector with vertex-penetration pre-repair AND
+    skin/anatomy **surface-intersection** pre-repair / per-iteration rejection.
+    Pass ``constraint_solver="legacy_single_push"`` plus
+    ``resolve_initial_penetration=False, resolve_initial_surface_intersections=False,
+    prevent_segment_crossing=False, prevent_surface_intersections=False,
     preserve_tangential=False, clearance_policy="global"`` to reproduce the
     historical one-shot smooth-min push. ``smooth_m5_region`` is unchanged.
     Pre-repair + smoothing share ONE Maya undo chunk. One optional backup.
@@ -3243,7 +3251,14 @@ def constrained_smooth_m5_region(indices, method="laplacian", strength=0.2,
             clearance_tolerance=clearance_tolerance,
             prevent_segment_crossing=prevent_segment_crossing,
             penetration_repair_feather_rings=penetration_repair_feather_rings,
-            preserve_tangential=preserve_tangential)
+            preserve_tangential=preserve_tangential,
+            resolve_initial_surface_intersections=resolve_initial_surface_intersections,
+            prevent_surface_intersections=prevent_surface_intersections,
+            surface_intersection_check_interval=surface_intersection_check_interval,
+            max_intersection_repair_iterations=max_intersection_repair_iterations,
+            intersection_repair_step_ratio=intersection_repair_step_ratio,
+            intersection_repair_growth_rings=intersection_repair_growth_rings,
+            boundary_buffer_rings=boundary_buffer_rings)
     finally:
         if opened:
             try:
@@ -3417,6 +3432,192 @@ def resolve_m5_region_penetrations(indices, min_clearance=None, mesh_name=None,
     return repair
 
 
+def analyze_m5_region_intersections(indices=None, mesh_name=None,
+                                    anatomical_meshes=None, detailed=False,
+                                    verbose=True, select_faces=False,
+                                    boundary_buffer_rings=1,
+                                    candidate_growth_rings=0):
+    """Detect skin FACE vs anatomy FACE intersections in an M5 region (or whole skin).
+
+    ``indices=None`` scans the entire skin (diagnostic only; does not move
+    vertices). Selects gray SKIN faces when ``select_faces=True`` -- never the
+    yellow/red anatomy by default.
+    """
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    if isinstance(indices, dict):
+        indices = indices.get("final_indices", [])
+    if indices is not None:
+        indices = list(indices)
+    backend, _sdf = _make_anatomy_backend(anatomical_meshes)
+    if backend is None:
+        print("[M5] no anatomy meshes found")
+        return
+    report = anatomy_constraint.analyze_skin_anatomy_intersections(
+        mesh_name, skin_indices=indices, backend=backend,
+        boundary_buffer_rings=boundary_buffer_rings,
+        candidate_growth_rings=candidate_growth_rings,
+        detailed=detailed, verbose=verbose)
+    if select_faces:
+        select_intersecting_skin_faces(report, mesh_name=mesh_name)
+    return report
+
+
+def select_intersecting_skin_faces(report, mesh_name=None):
+    """Select intersecting gray SKIN faces (not fat/muscle)."""
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    if not report:
+        print("[M5] no intersection report")
+        return []
+    return anatomy_constraint.select_intersecting_skin_faces(report, mesh_name)
+
+
+def select_intersecting_skin_vertices(report, mesh_name=None):
+    """Select skin vertices of intersecting faces."""
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    if not report:
+        print("[M5] no intersection report")
+        return []
+    return anatomy_constraint.select_intersecting_skin_vertices(report, mesh_name)
+
+
+def resolve_m5_region_intersections(indices, mesh_name=None, anatomical_meshes=None,
+                                    apply=True, verbose=True, create_backup=True,
+                                    min_clearance=None,
+                                    max_intersection_repair_iterations=20,
+                                    intersection_repair_step_ratio=0.10,
+                                    intersection_repair_growth_rings=0,
+                                    boundary_buffer_rings=1):
+    """SURFACE-INTERSECTION pre-repair ONLY (no Laplacian).
+
+    Pushes intersecting skin vertices outward along skin normals until
+    triangle-triangle crossings are gone or max iterations is reached.
+    One undo chunk. Does not move whole-skin vertices outside ``indices``.
+    """
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    if isinstance(indices, dict):
+        indices = indices.get("final_indices", [])
+    indices = list(indices)
+    if not indices:
+        print("[M5] no vertices to repair")
+        return
+    backend, _sdf = _make_anatomy_backend(anatomical_meshes)
+    if backend is None:
+        print("[M5] no anatomy meshes found")
+        return
+    min_clearance = _default_min_clearance(min_clearance)
+    verts = mesh_utils.get_mesh_vertices(mesh_name)
+    normals = mesh_utils.get_vertex_normals(mesh_name)
+    neighbors = mesh_utils.get_vertex_neighbors(mesh_name)
+    fn = mesh_utils.get_mesh_fn(mesh_name)
+    topo = mesh_utils.get_triangle_topology(fn) if fn is not None else None
+    if create_backup and apply:
+        bk = mesh_name + "_preintersectionrepair"
+        if not cmds.objExists(bk):
+            maya_io.duplicate_mesh(mesh_name, suffix="_preintersectionrepair")
+    opened = False
+    try:
+        cmds.undoInfo(openChunk=True, chunkName="resolve_m5_intersections")
+        opened = True
+    except Exception:
+        pass
+    try:
+        repair = anatomy_constraint.resolve_skin_anatomy_intersections(
+            verts, indices, backend, skin_mesh=mesh_name, neighbors=neighbors,
+            normals=normals, skin_topology=topo, min_clearance=min_clearance,
+            max_intersection_repair_iterations=max_intersection_repair_iterations,
+            intersection_repair_step_ratio=intersection_repair_step_ratio,
+            intersection_repair_growth_rings=intersection_repair_growth_rings,
+            boundary_buffer_rings=boundary_buffer_rings, verbose=verbose)
+        if apply:
+            mesh_utils.set_mesh_vertices(mesh_name, repair["positions"])
+    finally:
+        if opened:
+            try:
+                cmds.undoInfo(closeChunk=True)
+            except Exception:
+                pass
+    repair["apply"] = bool(apply)
+    return repair
+
+
+def repair_m5_region_anatomy_conflicts(indices, mesh_name=None,
+                                       anatomical_meshes=None, apply=True,
+                                       verbose=True, create_backup=True,
+                                       min_clearance=None):
+    """Combined vertex-penetration + surface-intersection pre-repair (no smoothing)."""
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    if isinstance(indices, dict):
+        indices = indices.get("final_indices", [])
+    indices = list(indices)
+    backend, _sdf = _make_anatomy_backend(anatomical_meshes)
+    if backend is None:
+        print("[M5] no anatomy meshes found")
+        return
+    min_clearance = _default_min_clearance(min_clearance)
+    verts = mesh_utils.get_mesh_vertices(mesh_name)
+    normals = mesh_utils.get_vertex_normals(mesh_name)
+    neighbors = mesh_utils.get_vertex_neighbors(mesh_name)
+    fn = mesh_utils.get_mesh_fn(mesh_name)
+    topo = mesh_utils.get_triangle_topology(fn) if fn is not None else None
+    if create_backup and apply:
+        bk = mesh_name + "_preanatomyrepair"
+        if not cmds.objExists(bk):
+            maya_io.duplicate_mesh(mesh_name, suffix="_preanatomyrepair")
+    opened = False
+    try:
+        cmds.undoInfo(openChunk=True, chunkName="repair_m5_anatomy_conflicts")
+        opened = True
+    except Exception:
+        pass
+    try:
+        result = anatomy_constraint.prepare_skin_region_for_smoothing(
+            verts, indices, backend, skin_mesh=mesh_name, neighbors=neighbors,
+            normals=normals, skin_topology=topo, min_clearance=min_clearance,
+            verbose=verbose)
+        if apply:
+            mesh_utils.set_mesh_vertices(mesh_name, result["positions"])
+    finally:
+        if opened:
+            try:
+                cmds.undoInfo(closeChunk=True)
+            except Exception:
+                pass
+    result["apply"] = bool(apply)
+    return result
+
+
+def debug_skin_anatomy_intersection(skin_face_id, mesh_name=None,
+                                    anatomical_meshes=None,
+                                    intersection_record=None):
+    """Diagnose one intersecting skin face."""
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    backend, _sdf = _make_anatomy_backend(anatomical_meshes)
+    if backend is None:
+        print("[M5] no anatomy meshes found")
+        return
+    verts = mesh_utils.get_mesh_vertices(mesh_name)
+    normals = mesh_utils.get_vertex_normals(mesh_name)
+    neighbors = mesh_utils.get_vertex_neighbors(mesh_name)
+    fn = mesh_utils.get_mesh_fn(mesh_name)
+    topo = mesh_utils.get_triangle_topology(fn) if fn is not None else None
+    return anatomy_constraint.debug_skin_anatomy_intersection(
+        skin_face_id, verts, backend, skin_mesh=mesh_name, neighbors=neighbors,
+        normals=normals, skin_topology=topo,
+        intersection_record=intersection_record, verbose=True)
+
+
 def restore_skin_from_backup(backup_name, mesh_name=None):
     """Copy world-space vertices from a backup mesh onto the live skin.
 
@@ -3556,7 +3757,12 @@ if HELPERS_AVAILABLE:
     print("  compare_m3_m4_m5(m5_report)                            - M5 count/overlap comparison (no re-run)")
     print("  smooth_m5_region(m5_idx, iterations=5)                - M5 smooth a detected region (unconstrained)")
     print("  constrained_smooth_m5_region(m5_idx, iterations=20)   - M5 ANATOMY-CONSTRAINED smooth (safe floor)")
-    print("  analyze_m5_region_penetration(fixed_region)           - classify skin vs anatomy (not shaders)")
+    print("  analyze_m5_region_intersections(fixed_region)         - skin FACE vs anatomy FACE (protrusion)")
+    print("  select_intersecting_skin_faces(report)                - select intersecting SKIN faces")
+    print("  select_intersecting_skin_vertices(report)             - select verts of intersecting faces")
+    print("  resolve_m5_region_intersections(fixed_region)         - outward repair of surface crossings")
+    print("  repair_m5_region_anatomy_conflicts(fixed_region)      - combined vertex+surface pre-repair")
+    print("  debug_skin_anatomy_intersection(face_id)              - diagnose one intersecting skin face")
     print("  select_penetrating_skin_vertices(report)              - select penetrating SKIN verts")
     print("  resolve_m5_region_penetrations(fixed_region)          - pre-repair penetrations only")
     print("  debug_skin_anatomy_vertex(i)                          - diagnose one skin vertex")

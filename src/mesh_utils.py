@@ -51,6 +51,12 @@ def vec_dot(a, b):
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 
 
+def vec_cross(a, b):
+    return [a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0]]
+
+
 def vec_normalize(v):
     n = vec_length(v)
     if n < 1e-12:
@@ -324,6 +330,104 @@ def select_vertices(mesh_name, indices, replace=True):
         return
     comps = ["{0}.vtx[{1}]".format(mesh_name, i) for i in indices]
     cmds.select(comps, replace=replace)
+
+
+def select_faces(mesh_name, face_ids, replace=True):
+    """Select the given face indices on ``mesh_name`` in the Maya viewport."""
+    if not MAYA_AVAILABLE or not face_ids:
+        return
+    comps = ["{0}.f[{1}]".format(mesh_name, int(i)) for i in face_ids]
+    cmds.select(comps, replace=replace)
+
+
+def get_face_vertex_ids(mesh_fn):
+    """Return per-face vertex-id lists (polygons may be tris/quads/n-gons).
+
+    Uses Maya API 2.0 ``MItMeshPolygon.getVertices``. Index of the returned
+    list is the original face id.
+    """
+    if not MAYA_AVAILABLE or mesh_fn is None or om is None:
+        return []
+    faces = []
+    it = om.MItMeshPolygon(mesh_fn.object())
+    while not it.isDone():
+        try:
+            verts = [int(v) for v in it.getVertices()]
+        except Exception:
+            verts = []
+        faces.append(verts)
+        it.next()
+    return faces
+
+
+def get_triangle_topology(mesh_fn):
+    """Triangulate every polygon; keep the mapping back to original face ids.
+
+    Returns a dict::
+
+        triangles: list of (face_id, i0, i1, i2)
+        face_vertex_ids: list[list[int]]  (original polygons)
+        vertex_faces: list[list[int]]     (incident original face ids)
+        face_triangles: dict[int, list[tuple]]
+
+    Prefers ``MFnMesh.getTriangles`` (handles quads/n-gons). Falls back to
+    ``MItMeshPolygon.getTriangles``. Topology only -- no world positions.
+    """
+    empty = {"triangles": [], "face_vertex_ids": [], "vertex_faces": [],
+             "face_triangles": {}}
+    if not MAYA_AVAILABLE or mesh_fn is None or om is None:
+        return empty
+    face_vertex_ids = get_face_vertex_ids(mesh_fn)
+    triangles = []
+    used_get_triangles = False
+    try:
+        counts, verts = mesh_fn.getTriangles()
+        used_get_triangles = True
+        vi = 0
+        n_counts = len(counts)
+        n_verts = len(verts)
+        for face_id in range(n_counts):
+            ntri = int(counts[face_id])
+            for _ in range(ntri):
+                if vi + 2 >= n_verts:
+                    break
+                i0, i1, i2 = int(verts[vi]), int(verts[vi + 1]), int(verts[vi + 2])
+                triangles.append((face_id, i0, i1, i2))
+                vi += 3
+    except Exception:
+        used_get_triangles = False
+        triangles = []
+    if not used_get_triangles:
+        it = om.MItMeshPolygon(mesh_fn.object())
+        face_id = 0
+        while not it.isDone():
+            try:
+                _pts, ids = it.getTriangles()
+                ids = [int(v) for v in ids]
+                for k in range(0, len(ids) - 2, 3):
+                    triangles.append((face_id, ids[k], ids[k + 1], ids[k + 2]))
+            except Exception:
+                verts = face_vertex_ids[face_id] if face_id < len(face_vertex_ids) else []
+                if len(verts) >= 3:
+                    for k in range(1, len(verts) - 1):
+                        triangles.append((face_id, verts[0], verts[k], verts[k + 1]))
+            face_id += 1
+            it.next()
+    n_verts_mesh = int(getattr(mesh_fn, "numVertices", 0) or 0)
+    vertex_faces = [[] for _ in range(n_verts_mesh)]
+    for fi, verts in enumerate(face_vertex_ids):
+        for v in verts:
+            if 0 <= v < n_verts_mesh:
+                vertex_faces[v].append(fi)
+    face_triangles = {}
+    for face_id, i0, i1, i2 in triangles:
+        face_triangles.setdefault(face_id, []).append((i0, i1, i2))
+    return {
+        "triangles": triangles,
+        "face_vertex_ids": face_vertex_ids,
+        "vertex_faces": vertex_faces,
+        "face_triangles": face_triangles,
+    }
 
 
 def grow_indices(neighbors, indices, rings=1):

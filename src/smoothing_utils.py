@@ -34,6 +34,8 @@ from mesh_utils import (
     set_mesh_vertices,
     get_vertex_neighbors,
     get_vertex_normals,
+    get_mesh_fn,
+    get_triangle_topology,
     grow_indices,
 )
 
@@ -251,7 +253,16 @@ def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearan
                                    clearance_tolerance=1e-4,
                                    prevent_segment_crossing=True,
                                    penetration_repair_feather_rings=0,
-                                   preserve_tangential=True):
+                                   preserve_tangential=True,
+                                   resolve_initial_surface_intersections=True,
+                                   prevent_surface_intersections=True,
+                                   surface_intersection_check_interval=1,
+                                   max_intersection_repair_iterations=20,
+                                   intersection_repair_step_ratio=0.10,
+                                   intersection_repair_growth_rings=0,
+                                   skin_topology=None,
+                                   intersection_tolerance=1e-6,
+                                   boundary_buffer_rings=1):
     """Anatomy-constrained localized smoothing (see section header).
 
     Parameters
@@ -317,6 +328,19 @@ def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearan
     do_prerepair = bool(resolve_initial_penetration) and anatomy_backend is not None
     do_segment = bool(prevent_segment_crossing) and anatomy_backend is not None
     do_tangent = bool(preserve_tangential) and use_exact
+    do_isect_prerepair = (bool(resolve_initial_surface_intersections)
+                          and anatomy_backend is not None)
+    do_isect_prevent = (bool(prevent_surface_intersections)
+                        and anatomy_backend is not None)
+
+    if skin_topology is None and (do_isect_prerepair or do_isect_prevent
+                                  or anatomy_backend is not None):
+        try:
+            fn = get_mesh_fn(mesh_name)
+            if fn is not None:
+                skin_topology = get_triangle_topology(fn)
+        except Exception:
+            skin_topology = None
 
     local_edge = {}
     if max_step_edge_ratio is not None:
@@ -388,6 +412,69 @@ def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearan
 
     after_prerepair = [list(v) for v in work]
 
+    isect_metrics = {
+        "intersecting_skin_face_count_before": 0,
+        "intersecting_skin_vertex_count_before": 0,
+        "intersection_pair_count_before": 0,
+        "intersection_repair_iterations": 0,
+        "intersection_vertices_moved": [],
+        "intersection_faces_resolved": 0,
+        "intersection_faces_unresolved": 0,
+        "mean_intersection_repair_displacement": 0.0,
+        "max_intersection_repair_displacement": 0.0,
+        "intersecting_skin_face_count_after_prerepair": 0,
+        "intersections_by_anatomy_mesh_before": {},
+        "new_intersections_detected_during_smoothing": 0,
+        "new_intersections_prevented": 0,
+        "unsafe_iterations_repaired": 0,
+        "unsafe_iterations_rejected": 0,
+    }
+    if anatomy_backend is not None:
+        isect0 = anatomy_constraint.analyze_skin_anatomy_intersections(
+            mesh_name, skin_indices=region, backend=anatomy_backend,
+            positions=before, neighbors=neighbors, skin_topology=skin_topology,
+            boundary_buffer_rings=boundary_buffer_rings,
+            intersection_tolerance=intersection_tolerance,
+            detailed=False, verbose=False)
+        isect_metrics["intersecting_skin_face_count_before"] = isect0.get(
+            "intersecting_skin_face_count", 0)
+        isect_metrics["intersecting_skin_vertex_count_before"] = isect0.get(
+            "intersecting_skin_vertex_count", 0)
+        isect_metrics["intersection_pair_count_before"] = isect0.get(
+            "intersection_pair_count", 0)
+        isect_metrics["intersections_by_anatomy_mesh_before"] = isect0.get(
+            "intersections_by_anatomy_mesh") or {}
+        isect_metrics["intersecting_skin_face_count_after_prerepair"] = isect0.get(
+            "intersecting_skin_face_count", 0)
+
+    if do_isect_prerepair:
+        irep = anatomy_constraint.resolve_skin_anatomy_intersections(
+            work, region, anatomy_backend, skin_mesh=mesh_name,
+            neighbors=neighbors, normals=normals, skin_topology=skin_topology,
+            min_clearance=min_clearance, clearance_tolerance=clearance_tolerance,
+            max_intersection_repair_iterations=max_intersection_repair_iterations,
+            intersection_repair_step_ratio=intersection_repair_step_ratio,
+            intersection_repair_growth_rings=intersection_repair_growth_rings,
+            boundary_buffer_rings=boundary_buffer_rings,
+            intersection_tolerance=intersection_tolerance, verbose=verbose)
+        work = irep["positions"]
+        isect_metrics["intersection_repair_iterations"] = irep.get(
+            "intersection_repair_iterations", 0)
+        isect_metrics["intersection_vertices_moved"] = irep.get(
+            "intersection_vertices_moved") or []
+        isect_metrics["intersection_faces_resolved"] = irep.get(
+            "intersection_faces_resolved", 0)
+        isect_metrics["intersection_faces_unresolved"] = irep.get(
+            "intersection_faces_unresolved", 0)
+        isect_metrics["mean_intersection_repair_displacement"] = irep.get(
+            "mean_intersection_repair_displacement", 0.0)
+        isect_metrics["max_intersection_repair_displacement"] = irep.get(
+            "max_intersection_repair_displacement", 0.0)
+        after_i = irep.get("report_after") or {}
+        isect_metrics["intersecting_skin_face_count_after_prerepair"] = after_i.get(
+            "intersecting_skin_face_count", 0)
+        after_prerepair = [list(v) for v in work]
+
     constrained_vertices = set()
     constraint_events = 0
     corrections = []
@@ -400,6 +487,7 @@ def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearan
     tangent_kept = []
 
     for it in range(max(1, iterations)):
+        before_it = [list(v) for v in work]
         proposed = _run_smoothing(work, neighbors, method, strength, active, 1)
 
         if max_step_edge_ratio is not None:
@@ -485,6 +573,59 @@ def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearan
                     if not ok:
                         unresolved_constraints += 1
 
+        isect_now = (do_isect_prevent and (
+            surface_intersection_check_interval <= 1
+            or (it % surface_intersection_check_interval == 0)))
+        if isect_now and skin_topology is not None:
+            moved = [i for i in active
+                     if vec_length(vec_sub(proposed[i], before_it[i])) > 1e-12]
+            if moved:
+                loc = anatomy_constraint.analyze_skin_anatomy_intersections(
+                    mesh_name, skin_indices=moved, backend=anatomy_backend,
+                    positions=proposed, neighbors=neighbors,
+                    skin_topology=skin_topology,
+                    candidate_growth_rings=1,
+                    boundary_buffer_rings=boundary_buffer_rings,
+                    intersection_tolerance=intersection_tolerance,
+                    detailed=False, verbose=False)
+                if loc.get("intersection_pair_count", 0) > 0:
+                    isect_metrics["new_intersections_detected_during_smoothing"] += 1
+                    irep = anatomy_constraint.resolve_skin_anatomy_intersections(
+                        proposed, moved, anatomy_backend, skin_mesh=mesh_name,
+                        neighbors=neighbors, normals=normals,
+                        skin_topology=skin_topology, min_clearance=min_clearance,
+                        clearance_tolerance=clearance_tolerance,
+                        max_intersection_repair_iterations=min(
+                            5, max_intersection_repair_iterations),
+                        intersection_repair_step_ratio=intersection_repair_step_ratio,
+                        intersection_repair_growth_rings=0,
+                        boundary_buffer_rings=boundary_buffer_rings,
+                        intersection_tolerance=intersection_tolerance,
+                        binary_search_min_step=False, verbose=False)
+                    proposed = irep["positions"]
+                    after_loc = irep.get("report_after") or {}
+                    if after_loc.get("intersection_pair_count", 0) <= 0:
+                        isect_metrics["new_intersections_prevented"] += 1
+                        isect_metrics["unsafe_iterations_repaired"] += 1
+                    else:
+                        core = anatomy_constraint.intersection_vertices_from_report(
+                            after_loc, skin_topology, allowed=set(active))
+                        for i in core:
+                            proposed[i] = list(before_it[i])
+                        still = anatomy_constraint.analyze_skin_anatomy_intersections(
+                            mesh_name, skin_indices=moved, backend=anatomy_backend,
+                            positions=proposed, neighbors=neighbors,
+                            skin_topology=skin_topology,
+                            candidate_growth_rings=1,
+                            boundary_buffer_rings=boundary_buffer_rings,
+                            intersection_tolerance=intersection_tolerance,
+                            detailed=False, verbose=False)
+                        if still.get("intersection_pair_count", 0) > 0:
+                            for i in moved:
+                                proposed[i] = list(before_it[i])
+                        isect_metrics["unsafe_iterations_rejected"] += 1
+                        isect_metrics["new_intersections_prevented"] += 1
+
         work = proposed
 
         if verbose_iterations and (it % max(1, report_interval) == 0):
@@ -548,11 +689,19 @@ def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearan
     corr = _sc_stats(corrections)
 
     final_pen = {"penetrating_count": 0, "likely_penetrating_count": 0, "unknown_count": 0}
+    final_isect = {"intersecting_skin_face_count": 0, "intersecting_skin_vertex_count": 0,
+                   "intersection_pair_count": 0, "intersections_by_anatomy_mesh": {}}
     if anatomy_backend is not None:
         final_pen = anatomy_constraint.analyze_skin_anatomy_penetration(
             mesh_name, indices=region, min_clearance=min_clearance,
             backend=anatomy_backend, positions=final, normals=normals,
             clearance_tolerance=clearance_tolerance, detailed=False, verbose=False)
+        final_isect = anatomy_constraint.analyze_skin_anatomy_intersections(
+            mesh_name, skin_indices=region, backend=anatomy_backend,
+            positions=final, neighbors=neighbors, skin_topology=skin_topology,
+            boundary_buffer_rings=boundary_buffer_rings,
+            intersection_tolerance=intersection_tolerance,
+            detailed=False, verbose=False)
 
     metrics = {
         "mesh": mesh_name,
@@ -621,6 +770,37 @@ def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearan
         "likely_penetrating_count_after": final_pen.get("likely_penetrating_count", 0),
         "unknown_count_after": final_pen.get("unknown_count", 0),
         "unknown_count_before": pen_before.get("unknown_count", 0),
+        "intersecting_skin_face_count_before": isect_metrics[
+            "intersecting_skin_face_count_before"],
+        "intersecting_skin_vertex_count_before": isect_metrics[
+            "intersecting_skin_vertex_count_before"],
+        "intersection_pair_count_before": isect_metrics["intersection_pair_count_before"],
+        "intersection_repair_iterations": isect_metrics["intersection_repair_iterations"],
+        "intersection_vertices_moved": isect_metrics["intersection_vertices_moved"],
+        "intersection_faces_resolved": isect_metrics["intersection_faces_resolved"],
+        "intersection_faces_unresolved": isect_metrics["intersection_faces_unresolved"],
+        "mean_intersection_repair_displacement": isect_metrics[
+            "mean_intersection_repair_displacement"],
+        "max_intersection_repair_displacement": isect_metrics[
+            "max_intersection_repair_displacement"],
+        "intersecting_skin_face_count_after_prerepair": isect_metrics[
+            "intersecting_skin_face_count_after_prerepair"],
+        "new_intersections_detected_during_smoothing": isect_metrics[
+            "new_intersections_detected_during_smoothing"],
+        "new_intersections_prevented": isect_metrics["new_intersections_prevented"],
+        "unsafe_iterations_repaired": isect_metrics["unsafe_iterations_repaired"],
+        "unsafe_iterations_rejected": isect_metrics["unsafe_iterations_rejected"],
+        "intersecting_skin_face_count_after": final_isect.get(
+            "intersecting_skin_face_count", 0),
+        "intersecting_skin_vertex_count_after": final_isect.get(
+            "intersecting_skin_vertex_count", 0),
+        "intersection_pair_count_after": final_isect.get("intersection_pair_count", 0),
+        "intersections_by_anatomy_mesh_before": isect_metrics[
+            "intersections_by_anatomy_mesh_before"],
+        "intersections_by_anatomy_mesh_after": final_isect.get(
+            "intersections_by_anatomy_mesh") or {},
+        "resolve_initial_surface_intersections": bool(do_isect_prerepair),
+        "prevent_surface_intersections": bool(do_isect_prevent),
         "apply": bool(apply),
         "after_prerepair_moved": any(
             vec_length(vec_sub(after_prerepair[i], before[i])) > 0.0 for i in region),
@@ -698,6 +878,23 @@ def _print_constrained_report(m):
     print("  tangent preserve: normal_removed_mean={0:.5f} tangential_kept_mean={1:.5f}".format(
         m.get("normal_component_removed_mean", 0.0),
         m.get("tangential_component_preserved_mean", 0.0)))
+    print("  SURFACE INTERSECTION: faces {0}->{1}  pairs {2}->{3}  "
+          "new_during_smooth={4} prevented={5} repaired_iters={6} rejected_iters={7}".format(
+              m.get("intersecting_skin_face_count_before", 0),
+              m.get("intersecting_skin_face_count_after", 0),
+              m.get("intersection_pair_count_before", 0),
+              m.get("intersection_pair_count_after", 0),
+              m.get("new_intersections_detected_during_smoothing", 0),
+              m.get("new_intersections_prevented", 0),
+              m.get("unsafe_iterations_repaired", 0),
+              m.get("unsafe_iterations_rejected", 0)))
+    print("  intersection pre-repair: iters={0} moved={1} resolved_faces={2} "
+          "unresolved={3} mean_disp={4:.5f}".format(
+              m.get("intersection_repair_iterations", 0),
+              len(m.get("intersection_vertices_moved") or []),
+              m.get("intersection_faces_resolved", 0),
+              m.get("intersection_faces_unresolved", 0),
+              m.get("mean_intersection_repair_displacement", 0.0)))
     if "scene_applied_max_displacement" in m:
         print("  fresh-read scene disp: mean={0:.5f} max={1:.5f}".format(
             m["scene_applied_mean_displacement"], m["scene_applied_max_displacement"]))

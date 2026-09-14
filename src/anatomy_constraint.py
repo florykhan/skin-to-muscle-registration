@@ -19,6 +19,10 @@ This module adds:
   inside (unsigned distance is not penetration)
 * a **pre-repair** pass for high-confidence penetrating vertices
 * optional **segment-crossing** clamps
+* a **surface-intersection / protrusion analyzer** (triangle-triangle) that
+  catches anatomy faces piercing skin faces even when every skin vertex is
+  still classified outside
+* iterative **outward intersection repair** before constrained smoothing
 
 Complexity (documented, not optimized away):
     Exact query: O(M) ``getClosestPoint`` per evaluation, M = # anatomy meshes
@@ -37,9 +41,11 @@ scene, or delete objects.
 from __future__ import print_function
 
 import math
+import time
 
 from mesh_utils import (
     vec_add,
+    vec_cross,
     vec_dot,
     vec_length,
     vec_normalize,
@@ -47,10 +53,13 @@ from mesh_utils import (
     vec_sub,
     closest_point_and_normal,
     get_boundary_vertices,
+    get_mesh_fn,
     get_mesh_vertices,
+    get_triangle_topology,
     get_vertex_normals,
     get_vertex_neighbors,
     grow_indices,
+    select_faces,
     select_vertices,
 )
 
@@ -422,6 +431,21 @@ class MayaAnatomyBackend(object):
         hit["mesh"] = mesh_name
         hit["frac"] = t / length
         return hit
+
+    def anatomy_surface_cache(self):
+        """Static triangulated anatomy with AABBs / uniform-grid broad phase.
+
+        Built once per backend. Anatomy is not moved by this module.
+        """
+        if getattr(self, "_surface_cache", None) is not None:
+            return self._surface_cache
+        cache = {}
+        for name, mesh_fn in self.mesh_fns.items():
+            if mesh_fn is None:
+                continue
+            cache[name] = build_anatomy_surface_cache(mesh_fn, name=name)
+        self._surface_cache = cache
+        return cache
 
 
 # ---------------------------------------------------------------------------
@@ -1220,3 +1244,924 @@ def debug_skin_anatomy_vertex(vertex_index, positions, backend,
 # Suggested aliases from the research brief.
 project_to_safe_anatomy_position = enforce_anatomy_clearance
 repair_skin_penetrations = resolve_skin_anatomy_penetrations
+
+# ---------------------------------------------------------------------------
+# SKIN–ANATOMY SURFACE INTERSECTION (triangle-triangle)
+# ---------------------------------------------------------------------------
+# Vertex penetration (a skin *point* inside / behind anatomy) is NOT the same
+# as an anatomy *face* crossing a skin *face*. All three vertices of a skin
+# triangle can be classified "clear" while an anatomy triangle still pierces
+# the triangle interior. This section detects that protrusion geometrically.
+#
+# Approach:
+#   Broad phase: mesh AABB, then uniform-grid of anatomy triangles, then
+#                per-triangle AABB overlap.
+#   Narrow phase: non-coplanar -- finite-segment vs triangle tests on ALL 6
+#                edges (3 skin + 3 anatomy) so either piercing direction is
+#                caught. Coplanar -- 2D SAT on the shared plane.
+# Distance < threshold is NEVER treated as an intersection.
+#
+# Open anatomy meshes are first-class: triangle-triangle does not need
+# inside/outside. Intentional openings (eyes/mouth/nostrils/neck) have no
+# skin face spanning the hole, so visibility-through-a-hole is not flagged.
+
+DEFAULT_INTERSECTION_TOLERANCE = 1e-6
+DEFAULT_MAX_INTERSECTION_REPAIR_ITERATIONS = 20
+DEFAULT_INTERSECTION_REPAIR_STEP_RATIO = 0.10
+AUTO_REPAIR_INTERSECTION_CLASSES = ("crossing", "coplanar_overlap")
+DEBUG_ISECT_PREFIX = "smr_isect_dbg_"
+
+
+def _aabb_from_points(pts, pad=0.0):
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    zs = [p[2] for p in pts]
+    return (min(xs) - pad, min(ys) - pad, min(zs) - pad,
+            max(xs) + pad, max(ys) + pad, max(zs) + pad)
+
+
+def _aabb_union(aabbs):
+    if not aabbs:
+        return None
+    xmin = min(a[0] for a in aabbs)
+    ymin = min(a[1] for a in aabbs)
+    zmin = min(a[2] for a in aabbs)
+    xmax = max(a[3] for a in aabbs)
+    ymax = max(a[4] for a in aabbs)
+    zmax = max(a[5] for a in aabbs)
+    return (xmin, ymin, zmin, xmax, ymax, zmax)
+
+
+def _aabb_overlap(a, b, pad=0.0):
+    if a is None or b is None:
+        return False
+    return not (a[3] + pad < b[0] or b[3] + pad < a[0]
+                or a[4] + pad < b[1] or b[4] + pad < a[1]
+                or a[5] + pad < b[2] or b[5] + pad < a[2])
+
+
+class _UniformGrid(object):
+    """Integer-hash grid over triangle AABBs (broad phase)."""
+
+    def __init__(self, tri_aabbs, cell):
+        self.cell = max(float(cell), 1e-6)
+        self.buckets = {}
+        for idx, aabb in enumerate(tri_aabbs):
+            for key in self._keys(aabb):
+                self.buckets.setdefault(key, []).append(idx)
+
+    def _keys(self, aabb):
+        c = self.cell
+        i0 = int(math.floor(aabb[0] / c))
+        j0 = int(math.floor(aabb[1] / c))
+        k0 = int(math.floor(aabb[2] / c))
+        i1 = int(math.floor(aabb[3] / c))
+        j1 = int(math.floor(aabb[4] / c))
+        k1 = int(math.floor(aabb[5] / c))
+        keys = []
+        for i in range(i0, i1 + 1):
+            for j in range(j0, j1 + 1):
+                for k in range(k0, k1 + 1):
+                    keys.append((i, j, k))
+        return keys
+
+    def query(self, aabb):
+        seen = set()
+        out = []
+        for key in self._keys(aabb):
+            for idx in self.buckets.get(key, ()):
+                if idx not in seen:
+                    seen.add(idx)
+                    out.append(idx)
+        return out
+
+
+def build_anatomy_surface_cache(mesh_fn, name=None, points=None, topology=None):
+    """Build a static triangle cache for one anatomy mesh (Maya or synthetic)."""
+    if topology is None and mesh_fn is not None:
+        topology = get_triangle_topology(mesh_fn)
+    if topology is None:
+        topology = {"triangles": [], "face_vertex_ids": []}
+    if points is None and mesh_fn is not None and MAYA_AVAILABLE and om is not None:
+        try:
+            pts = mesh_fn.getPoints(om.MSpace.kWorld)
+            points = [[p.x, p.y, p.z] for p in pts]
+        except Exception:
+            points = []
+    points = points or []
+    triangles = topology.get("triangles") or []
+    tri_points = []
+    tri_aabb = []
+    for face_id, i0, i1, i2 in triangles:
+        if max(i0, i1, i2) >= len(points):
+            continue
+        tp = (list(points[i0]), list(points[i1]), list(points[i2]))
+        tri_points.append(tp)
+        tri_aabb.append(_aabb_from_points(tp))
+    mesh_aabb = _aabb_union(tri_aabb)
+    grid = None
+    if tri_aabb:
+        extents = [max(a[3] - a[0], a[4] - a[1], a[5] - a[2]) for a in tri_aabb]
+        mean_e = sum(extents) / len(extents)
+        if mesh_aabb is not None:
+            diag = math.sqrt((mesh_aabb[3] - mesh_aabb[0]) ** 2
+                             + (mesh_aabb[4] - mesh_aabb[1]) ** 2
+                             + (mesh_aabb[5] - mesh_aabb[2]) ** 2)
+            cell = max(mean_e * 1.5, diag / 32.0, 1e-4)
+        else:
+            cell = max(mean_e * 1.5, 1e-4)
+        if len(tri_aabb) >= 8:
+            grid = _UniformGrid(tri_aabb, cell)
+    return {
+        "name": name,
+        "triangles": triangles,
+        "points": points,
+        "tri_points": tri_points,
+        "tri_aabb": tri_aabb,
+        "mesh_aabb": mesh_aabb,
+        "grid": grid,
+        "topology": topology,
+        "category": anatomy_category_from_name(name),
+    }
+
+
+def _segment_triangle_hit(p0, p1, tri, eps):
+    """Möller–Trumbore on the finite segment p0->p1 vs triangle tri.
+
+    Returns dict {t, u, v, point, interior} or None.
+    ``interior`` is True when the hit is clearly inside both the segment and
+    the triangle (not on a vertex/edge within ``eps``).
+    """
+    a, b, c = tri
+    e1 = vec_sub(b, a)
+    e2 = vec_sub(c, a)
+    direction = vec_sub(p1, p0)
+    h = vec_cross(direction, e2)
+    det = vec_dot(e1, h)
+    if abs(det) < eps:
+        return None  # parallel; coplanar handled separately
+    inv = 1.0 / det
+    s = vec_sub(p0, a)
+    u = inv * vec_dot(s, h)
+    if u < -eps or u > 1.0 + eps:
+        return None
+    q = vec_cross(s, e1)
+    v = inv * vec_dot(direction, q)
+    if v < -eps or (u + v) > 1.0 + eps:
+        return None
+    t = inv * vec_dot(e2, q)
+    if t < -eps or t > 1.0 + eps:
+        return None
+    point = vec_add(p0, vec_scale(direction, t))
+    interior = (eps < t < 1.0 - eps and u > eps and v > eps and (u + v) < 1.0 - eps)
+    return {"t": t, "u": u, "v": v, "point": point, "interior": interior}
+
+
+def _project_tri_2d(tri, normal):
+    ax = abs(normal[0])
+    ay = abs(normal[1])
+    az = abs(normal[2])
+    if ax >= ay and ax >= az:
+        return [[p[1], p[2]] for p in tri]
+    if ay >= ax and ay >= az:
+        return [[p[0], p[2]] for p in tri]
+    return [[p[0], p[1]] for p in tri]
+
+
+def _sat_2d(A, B, eps):
+    """Return ('overlap'|'touching'|None) for two 2D triangles."""
+    def axes(T):
+        out = []
+        for i in range(3):
+            x0, y0 = T[i]
+            x1, y1 = T[(i + 1) % 3]
+            n = (y0 - y1, x1 - x0)
+            ln = math.hypot(n[0], n[1])
+            if ln > eps:
+                out.append((n[0] / ln, n[1] / ln))
+        return out
+    min_overlap = float("inf")
+    for n in axes(A) + axes(B):
+        pa = [p[0] * n[0] + p[1] * n[1] for p in A]
+        pb = [p[0] * n[0] + p[1] * n[1] for p in B]
+        overlap = min(max(pa), max(pb)) - max(min(pa), min(pb))
+        if overlap < -eps:
+            return None
+        if overlap < min_overlap:
+            min_overlap = overlap
+    if min_overlap > eps:
+        return "overlap"
+    return "touching"
+
+
+def triangle_triangle_intersection(tri_a, tri_b, eps=DEFAULT_INTERSECTION_TOLERANCE):
+    """Classify the intersection of two triangles in R^3.
+
+    Returns ``(classification, point_or_none)`` where classification is one of
+    ``crossing``, ``touching``, ``coplanar_overlap``, ``uncertain``, or None
+    (no intersection). Tests edges of BOTH triangles (skin vs anatomy and
+    anatomy vs skin). Close-but-not-intersecting pairs are not flagged.
+    """
+    a0, a1, a2 = tri_a
+    b0, b1, b2 = tri_b
+    n_a = vec_cross(vec_sub(a1, a0), vec_sub(a2, a0))
+    n_b = vec_cross(vec_sub(b1, b0), vec_sub(b2, b0))
+    area_a = vec_length(n_a)
+    area_b = vec_length(n_b)
+    if area_a < eps or area_b < eps:
+        return "uncertain", None
+    n_a = vec_scale(n_a, 1.0 / area_a)
+    n_b = vec_scale(n_b, 1.0 / area_b)
+    da = -vec_dot(n_a, a0)
+    db = -vec_dot(n_b, b0)
+    dist_b = [vec_dot(n_a, p) + da for p in tri_b]
+    dist_a = [vec_dot(n_b, p) + db for p in tri_a]
+    if (all(d > eps for d in dist_b) or all(d < -eps for d in dist_b)
+            or all(d > eps for d in dist_a) or all(d < -eps for d in dist_a)):
+        return None, None
+    coplanar = (all(abs(d) <= eps for d in dist_b)
+                or all(abs(d) <= eps for d in dist_a))
+    if coplanar:
+        A2 = _project_tri_2d(tri_a, n_a)
+        B2 = _project_tri_2d(tri_b, n_a)
+        sat = _sat_2d(A2, B2, eps)
+        if sat == "overlap":
+            mid = [(a0[i] + a1[i] + a2[i]) / 3.0 for i in range(3)]
+            return "coplanar_overlap", mid
+        if sat == "touching":
+            return "touching", list(a0)
+        return None, None
+    hits = []
+    interior = False
+    for (p, q) in ((a0, a1), (a1, a2), (a2, a0)):
+        h = _segment_triangle_hit(p, q, tri_b, eps)
+        if h:
+            hits.append(h)
+            interior = interior or h["interior"]
+    for (p, q) in ((b0, b1), (b1, b2), (b2, b0)):
+        h = _segment_triangle_hit(p, q, tri_a, eps)
+        if h:
+            hits.append(h)
+            interior = interior or h["interior"]
+    if not hits:
+        return None, None
+    pt = hits[0]["point"]
+    if interior:
+        return "crossing", pt
+    return "touching", pt
+
+
+def _buffered_boundary_vertices(skin_mesh, neighbors, rings, boundary_set=None):
+    if boundary_set is None:
+        try:
+            boundary_set = set(get_boundary_vertices(skin_mesh) or [])
+        except Exception:
+            boundary_set = set()
+    if rings and rings > 0 and neighbors is not None and boundary_set:
+        return set(grow_indices(neighbors, list(boundary_set), rings=int(rings)))
+    return set(boundary_set or [])
+
+
+def _faces_incident_to_vertices(vertex_faces, indices, extra_face_ids=None):
+    faces = set(extra_face_ids or [])
+    for i in indices:
+        if 0 <= i < len(vertex_faces):
+            faces.update(vertex_faces[i])
+    return faces
+
+
+def _empty_intersection_report():
+    return {
+        "candidate_skin_vertex_count": 0,
+        "candidate_skin_face_count": 0,
+        "intersecting_skin_face_count": 0,
+        "intersecting_skin_vertex_count": 0,
+        "intersecting_skin_faces": [],
+        "intersecting_skin_vertices": [],
+        "intersection_core_vertices": [],
+        "intersection_pair_count": 0,
+        "touching_pair_count": 0,
+        "uncertain_pair_count": 0,
+        "coplanar_overlap_pair_count": 0,
+        "crossing_pair_count": 0,
+        "intersections_by_anatomy_mesh": {},
+        "intersecting_anatomy_meshes": [],
+        "boundary_excluded_face_count": 0,
+        "runtime_seconds": 0.0,
+        "details": None,
+    }
+
+
+def analyze_skin_anatomy_intersections(skin_mesh, skin_indices=None,
+                                       anatomical_meshes=None, backend=None,
+                                       positions=None, neighbors=None,
+                                       skin_topology=None,
+                                       boundary_buffer_rings=1,
+                                       candidate_growth_rings=0,
+                                       intersection_tolerance=DEFAULT_INTERSECTION_TOLERANCE,
+                                       detailed=False, verbose=True,
+                                       exclude_boundary_faces=True):
+    """Detect skin-face / anatomy-face intersections (protrusions).
+
+    ``skin_indices=None`` scans the whole skin. Otherwise every skin face
+    incident to the given vertices is tested (a face is in scope if *any* of
+    its vertices is in the region). Not a vertex-path test: this is actual
+    triangle-triangle intersection. Open anatomy meshes are supported.
+    """
+    t0 = time.time()
+    report = _empty_intersection_report()
+    if positions is None and skin_mesh:
+        positions = get_mesh_vertices(skin_mesh)
+    if not positions:
+        if verbose:
+            print("[intersection] no skin vertices")
+        return report
+    if neighbors is None and skin_mesh:
+        try:
+            neighbors = get_vertex_neighbors(skin_mesh)
+        except Exception:
+            neighbors = None
+    if skin_topology is None:
+        mesh_fn = get_mesh_fn(skin_mesh) if skin_mesh else None
+        if mesh_fn is not None:
+            skin_topology = get_triangle_topology(mesh_fn)
+        else:
+            skin_topology = {"triangles": [], "face_vertex_ids": [],
+                             "vertex_faces": [[] for _ in positions]}
+    triangles = skin_topology.get("triangles") or []
+    face_vertex_ids = skin_topology.get("face_vertex_ids") or []
+    vertex_faces = skin_topology.get("vertex_faces") or []
+    n = len(positions)
+    if skin_indices is None:
+        region = list(range(n))
+    else:
+        region = sorted(set(int(i) for i in skin_indices if 0 <= int(i) < n))
+        if candidate_growth_rings and neighbors is not None:
+            region = sorted(set(grow_indices(neighbors, region,
+                                             rings=int(candidate_growth_rings))))
+    candidate_faces = _faces_incident_to_vertices(vertex_faces, region)
+    if not candidate_faces and triangles:
+        # topology without vertex_faces (synthetic): include faces whose
+        # triangle verts intersect the region.
+        region_set = set(region)
+        for face_id, i0, i1, i2 in triangles:
+            if i0 in region_set or i1 in region_set or i2 in region_set:
+                candidate_faces.add(face_id)
+    buffered = _buffered_boundary_vertices(
+        skin_mesh, neighbors, boundary_buffer_rings) if exclude_boundary_faces else set()
+    excluded_faces = set()
+    if buffered:
+        for fi in list(candidate_faces):
+            verts = face_vertex_ids[fi] if fi < len(face_vertex_ids) else []
+            if verts and all(v in buffered for v in verts):
+                excluded_faces.add(fi)
+            elif verts and any(v in buffered for v in verts) and len(verts) >= 3:
+                # Face that *touches* a buffered opening: exclude only if it
+                # has a true boundary vertex (opening edge), already in buffer.
+                if any(v in buffered for v in verts):
+                    # Conservative: skip faces with ANY buffered-boundary vert
+                    # so eye/mouth/nostril/neck rims are not treated as errors
+                    # merely because anatomy is visible through the hole.
+                    excluded_faces.add(fi)
+    tested_faces = candidate_faces - excluded_faces
+    report["candidate_skin_vertex_count"] = len(region)
+    report["candidate_skin_face_count"] = len(candidate_faces)
+    report["boundary_excluded_face_count"] = len(excluded_faces)
+
+    cache = {}
+    if backend is not None and hasattr(backend, "anatomy_surface_cache"):
+        cache = backend.anatomy_surface_cache() or {}
+    elif anatomical_meshes and isinstance(anatomical_meshes, dict):
+        # dict of name -> prebuilt cache entries or {points, triangles}
+        cache = anatomical_meshes
+
+    # Skin triangle list restricted to tested faces.
+    skin_tris = []  # (face_id, (p0,p1,p2), aabb, (i0,i1,i2))
+    for face_id, i0, i1, i2 in triangles:
+        if face_id not in tested_faces:
+            continue
+        if max(i0, i1, i2) >= n:
+            continue
+        tp = (positions[i0], positions[i1], positions[i2])
+        skin_tris.append((face_id, tp, _aabb_from_points(tp), (i0, i1, i2)))
+    skin_union_aabb = _aabb_union([t[2] for t in skin_tris])
+
+    crossing_faces = set()
+    touching_faces = set()
+    overlap_faces = set()
+    uncertain_faces = set()
+    pairs_by_mesh = {}
+    pair_count = {"crossing": 0, "touching": 0, "coplanar_overlap": 0, "uncertain": 0}
+    details = [] if detailed else None
+    eps = float(intersection_tolerance)
+
+    for mesh_name, entry in cache.items():
+        if not entry:
+            continue
+        mesh_aabb = entry.get("mesh_aabb")
+        if skin_union_aabb is not None and mesh_aabb is not None:
+            if not _aabb_overlap(skin_union_aabb, mesh_aabb):
+                continue
+        tri_points = entry.get("tri_points") or []
+        tri_aabb = entry.get("tri_aabb") or []
+        tri_ids = entry.get("triangles") or []
+        grid = entry.get("grid")
+        mesh_pairs = 0
+        for face_id, stp, saabb, sidx in skin_tris:
+            if grid is not None:
+                cand = grid.query(saabb)
+            else:
+                cand = range(len(tri_points))
+            for ti in cand:
+                if ti >= len(tri_points):
+                    continue
+                aaabb = tri_aabb[ti] if ti < len(tri_aabb) else None
+                if aaabb is not None and not _aabb_overlap(saabb, aaabb):
+                    continue
+                atp = tri_points[ti]
+                klass, pt = triangle_triangle_intersection(stp, atp, eps=eps)
+                if klass is None:
+                    continue
+                pair_count[klass] = pair_count.get(klass, 0) + 1
+                mesh_pairs += 1
+                aface = tri_ids[ti][0] if ti < len(tri_ids) else -1
+                if klass == "crossing":
+                    crossing_faces.add(face_id)
+                elif klass == "coplanar_overlap":
+                    overlap_faces.add(face_id)
+                elif klass == "touching":
+                    touching_faces.add(face_id)
+                elif klass == "uncertain":
+                    uncertain_faces.add(face_id)
+                if details is not None:
+                    details.append({
+                        "skin_face_id": face_id,
+                        "skin_vertex_indices": list(sidx),
+                        "anatomy_mesh": mesh_name,
+                        "anatomy_category": anatomy_category_from_name(mesh_name),
+                        "anatomy_face_id": aface,
+                        "classification": klass,
+                        "point": pt,
+                    })
+        if mesh_pairs:
+            pairs_by_mesh[mesh_name] = pairs_by_mesh.get(mesh_name, 0) + mesh_pairs
+
+    intersecting_faces = sorted(crossing_faces | overlap_faces)
+    # Report vertices of any flagged intersecting (repair-class) face.
+    isect_verts = set()
+    for fi in intersecting_faces:
+        if fi < len(face_vertex_ids):
+            isect_verts.update(face_vertex_ids[fi])
+        else:
+            for face_id, i0, i1, i2 in triangles:
+                if face_id == fi:
+                    isect_verts.update((i0, i1, i2))
+    report.update({
+        "intersecting_skin_face_count": len(intersecting_faces),
+        "intersecting_skin_vertex_count": len(isect_verts),
+        "intersecting_skin_faces": intersecting_faces,
+        "intersecting_skin_vertices": sorted(isect_verts),
+        "intersection_core_vertices": sorted(isect_verts),
+        "intersection_pair_count": pair_count.get("crossing", 0) + pair_count.get("coplanar_overlap", 0),
+        "crossing_pair_count": pair_count.get("crossing", 0),
+        "touching_pair_count": pair_count.get("touching", 0),
+        "uncertain_pair_count": pair_count.get("uncertain", 0),
+        "coplanar_overlap_pair_count": pair_count.get("coplanar_overlap", 0),
+        "intersections_by_anatomy_mesh": pairs_by_mesh,
+        "intersecting_anatomy_meshes": sorted(pairs_by_mesh.keys()),
+        "touching_skin_faces": sorted(touching_faces),
+        "uncertain_skin_faces": sorted(uncertain_faces),
+        "runtime_seconds": time.time() - t0,
+        "details": details,
+        "intersection_tolerance": eps,
+        "skin_topology": None,  # not dumped; caller already has it
+    })
+    if verbose:
+        print_intersection_report(report)
+    return report
+
+
+def print_intersection_report(report, label=""):
+    prefix = "[intersection{0}]".format(" " + label if label else "")
+    print("{0} faces={1}/{2} verts={3} pairs={4} (crossing={5} overlap={6} "
+          "touching={7} uncertain={8})  {9:.3f}s".format(
+              prefix,
+              report.get("intersecting_skin_face_count", 0),
+              report.get("candidate_skin_face_count", 0),
+              report.get("intersecting_skin_vertex_count", 0),
+              report.get("intersection_pair_count", 0),
+              report.get("crossing_pair_count", 0),
+              report.get("coplanar_overlap_pair_count", 0),
+              report.get("touching_pair_count", 0),
+              report.get("uncertain_pair_count", 0),
+              report.get("runtime_seconds", 0.0)))
+    bym = report.get("intersections_by_anatomy_mesh") or {}
+    if bym:
+        parts = ["{0}:{1}".format(k, v) for k, v in sorted(bym.items(),
+                                                           key=lambda kv: -kv[1])]
+        print("  by anatomy mesh: {0}".format(", ".join(parts[:12])
+                                              + (" ..." if len(parts) > 12 else "")))
+
+
+def select_intersecting_skin_faces(report, mesh_name, replace=True):
+    faces = report.get("intersecting_skin_faces") or []
+    if not faces:
+        print("[intersection] no intersecting skin faces to select")
+        return []
+    select_faces(mesh_name, faces, replace=replace)
+    print("[intersection] selected {0} intersecting SKIN faces".format(len(faces)))
+    return list(faces)
+
+
+def select_intersecting_skin_vertices(report, mesh_name, replace=True):
+    idx = report.get("intersecting_skin_vertices") or []
+    if not idx:
+        print("[intersection] no intersecting skin vertices to select")
+        return []
+    select_vertices(mesh_name, idx, replace=replace)
+    print("[intersection] selected {0} intersecting SKIN vertices".format(len(idx)))
+    return list(idx)
+
+
+def _mean_local_edge(positions, neighbors, index):
+    if neighbors is None or index >= len(neighbors) or not neighbors[index]:
+        return 0.0
+    nbrs = neighbors[index]
+    return (sum(vec_length(vec_sub(positions[index], positions[j])) for j in nbrs)
+            / float(len(nbrs)))
+
+
+def _outward_skin_normal(index, normals, positions, skin_topology):
+    n = None
+    if normals is not None and index < len(normals):
+        n = vec_normalize(normals[index])
+    if n is not None and vec_length(n) > 1e-12:
+        return n
+    # Area-weighted average of incident triangle normals.
+    vertex_faces = (skin_topology or {}).get("vertex_faces") or []
+    triangles = (skin_topology or {}).get("triangles") or []
+    acc = [0.0, 0.0, 0.0]
+    faces = vertex_faces[index] if index < len(vertex_faces) else []
+    face_set = set(faces)
+    for face_id, i0, i1, i2 in triangles:
+        if face_set and face_id not in face_set:
+            continue
+        if not face_set and index not in (i0, i1, i2):
+            continue
+        if max(i0, i1, i2) >= len(positions):
+            continue
+        a, b, c = positions[i0], positions[i1], positions[i2]
+        cr = vec_cross(vec_sub(b, a), vec_sub(c, a))
+        acc = vec_add(acc, cr)
+    n = vec_normalize(acc)
+    if vec_length(n) < 1e-12:
+        n = [0.0, 0.0, 1.0]
+    return n
+
+
+def intersection_vertices_from_report(report, skin_topology, allowed=None,
+                                      boundary=None):
+    """Map intersecting faces -> vertex ids, then clip by allowed/boundary."""
+    core = set()
+    faces = report.get("intersecting_skin_faces") or []
+    face_vertex_ids = (skin_topology or {}).get("face_vertex_ids") or []
+    triangles = (skin_topology or {}).get("triangles") or []
+    for fi in faces:
+        if fi < len(face_vertex_ids) and face_vertex_ids[fi]:
+            core.update(face_vertex_ids[fi])
+        else:
+            for face_id, i0, i1, i2 in triangles:
+                if face_id == fi:
+                    core.update((i0, i1, i2))
+    if allowed is not None:
+        core &= set(allowed)
+    if boundary:
+        core -= set(boundary)
+    return sorted(core)
+
+
+def resolve_skin_anatomy_intersections(
+        positions, skin_indices, backend,
+        skin_mesh=None, neighbors=None, normals=None, skin_topology=None,
+        min_clearance=0.8, clearance_tolerance=DEFAULT_CLEARANCE_TOLERANCE,
+        max_intersection_repair_iterations=DEFAULT_MAX_INTERSECTION_REPAIR_ITERATIONS,
+        intersection_repair_step_ratio=DEFAULT_INTERSECTION_REPAIR_STEP_RATIO,
+        intersection_repair_growth_rings=0,
+        boundary_buffer_rings=1,
+        intersection_tolerance=DEFAULT_INTERSECTION_TOLERANCE,
+        repair_classes=AUTO_REPAIR_INTERSECTION_CLASSES,
+        binary_search_min_step=True,
+        verbose=True):
+    """Move intersecting skin vertices OUTWARD until crossings are gone.
+
+    Does not run Laplacian smoothing. Uncertain/touching pairs are not
+    auto-repaired. Opening-boundary vertices (buffered) are not moved.
+    Optional group binary-search finds an approximate *minimal* outward scale
+    once a full step has cleared the local crossings.
+    """
+    work = [list(v) for v in positions]
+    n = len(work)
+    allowed = set(i for i in (skin_indices or range(n)) if 0 <= i < n)
+    if intersection_repair_growth_rings and neighbors is not None:
+        allowed = set(grow_indices(neighbors, list(allowed),
+                                   rings=int(intersection_repair_growth_rings)))
+    boundary = _buffered_boundary_vertices(
+        skin_mesh, neighbors, boundary_buffer_rings)
+    allowed -= boundary
+
+    def _analyze(pos, indices=None):
+        return analyze_skin_anatomy_intersections(
+            skin_mesh, skin_indices=indices if indices is not None else sorted(allowed),
+            backend=backend, positions=pos, neighbors=neighbors,
+            skin_topology=skin_topology,
+            boundary_buffer_rings=boundary_buffer_rings,
+            intersection_tolerance=intersection_tolerance,
+            detailed=False, verbose=False)
+
+    before = _analyze(work)
+    moved = set()
+    displacements = []
+    last_report = before
+    resolved_faces = set()
+    iters_used = 0
+    auto = set(repair_classes or AUTO_REPAIR_INTERSECTION_CLASSES)
+
+    for it in range(max(1, int(max_intersection_repair_iterations))):
+        iters_used = it + 1
+        last_report = _analyze(work)
+        # Only auto-repair crossing / optional coplanar_overlap faces.
+        repair_faces = set(last_report.get("intersecting_skin_faces") or [])
+        if "coplanar_overlap" not in auto:
+            # re-filter is approximate; intersecting_skin_faces already is
+            # crossing ∪ overlap. If overlap excluded, drop overlap-only via details
+            # not available; treat all intersecting_skin_faces as repair targets
+            # when crossing is in auto (default includes both).
+            pass
+        if last_report.get("intersection_pair_count", 0) <= 0:
+            break
+        core = intersection_vertices_from_report(
+            last_report, skin_topology, allowed=allowed, boundary=boundary)
+        if not core:
+            break
+        unsafe = {i: list(work[i]) for i in core}
+        step_ratio = float(intersection_repair_step_ratio)
+        # Mild adaptive increase if the same faces persist.
+        if it >= 4:
+            step_ratio *= 1.5
+        if it >= 10:
+            step_ratio *= 1.5
+        for i in core:
+            nrm = _outward_skin_normal(i, normals, work, skin_topology)
+            edge = _mean_local_edge(work, neighbors, i)
+            if edge <= 1e-12:
+                edge = vec_length(nrm) or 1.0
+            step = step_ratio * edge
+            work[i] = vec_add(work[i], vec_scale(nrm, step))
+            if min_clearance is not None and backend is not None:
+                sol = enforce_anatomy_clearance(
+                    work[i], backend, min_clearance,
+                    clearance_tolerance=clearance_tolerance, skin_normal=nrm)
+                work[i] = sol["position"]
+            moved.add(i)
+        trial = _analyze(work, indices=core)
+        if (trial.get("intersection_pair_count", 0) <= 0
+                and binary_search_min_step):
+            lo, hi = 0.0, 1.0
+            best = {i: list(work[i]) for i in core}
+            for _ in range(6):
+                mid = 0.5 * (lo + hi)
+                for i in core:
+                    work[i] = [
+                        unsafe[i][k] + mid * (best[i][k] - unsafe[i][k])
+                        for k in range(3)]
+                mid_rep = _analyze(work, indices=core)
+                if mid_rep.get("intersection_pair_count", 0) <= 0:
+                    hi = mid
+                    best = {i: list(work[i]) for i in core}
+                else:
+                    lo = mid
+            for i in core:
+                work[i] = best[i]
+        for i in core:
+            displacements.append(vec_length(vec_sub(work[i], positions[i])))
+        now_faces = set((_analyze(work).get("intersecting_skin_faces") or []))
+        resolved_faces |= (repair_faces - now_faces)
+
+    after = _analyze(work)
+    unresolved_faces = after.get("intersecting_skin_faces") or []
+    result = {
+        "positions": work,
+        "intersection_repair_iterations": iters_used,
+        "intersection_vertices_moved": sorted(moved),
+        "intersection_faces_resolved": len(resolved_faces),
+        "intersection_faces_unresolved": len(unresolved_faces),
+        "mean_intersection_repair_displacement": (
+            (sum(displacements) / len(displacements)) if displacements else 0.0),
+        "max_intersection_repair_displacement": (
+            max(displacements) if displacements else 0.0),
+        "report_before": before,
+        "report_after": after,
+        "unresolved_intersecting_faces": unresolved_faces,
+    }
+    if verbose:
+        print("[intersection-repair] iters={0} moved={1} faces {2}->{3} "
+              "resolved={4} unresolved={5} mean_disp={6:.5f} max_disp={7:.5f}".format(
+                  iters_used, len(moved),
+                  before.get("intersecting_skin_face_count", 0),
+                  after.get("intersecting_skin_face_count", 0),
+                  len(resolved_faces), len(unresolved_faces),
+                  result["mean_intersection_repair_displacement"],
+                  result["max_intersection_repair_displacement"]))
+    return result
+
+
+repair_skin_anatomy_intersections = resolve_skin_anatomy_intersections
+
+
+def prepare_skin_region_for_smoothing(
+        positions, skin_indices, backend,
+        skin_mesh=None, neighbors=None, normals=None, skin_topology=None,
+        min_clearance=0.8, clearance_tolerance=DEFAULT_CLEARANCE_TOLERANCE,
+        max_escape_iterations=DEFAULT_MAX_ESCAPE_ITERATIONS,
+        max_intersection_repair_iterations=DEFAULT_MAX_INTERSECTION_REPAIR_ITERATIONS,
+        intersection_repair_step_ratio=DEFAULT_INTERSECTION_REPAIR_STEP_RATIO,
+        intersection_repair_growth_rings=0,
+        penetration_repair_feather_rings=0,
+        boundary_buffer_rings=1,
+        verbose=True):
+    """Combined pre-repair: vertex penetration then remaining surface crossings.
+
+    Recommended order (this function)::
+
+        analyze intersections + vertex penetration
+        repair high-confidence vertex penetration
+        repair remaining surface intersections
+        re-run BOTH analyzers
+    """
+    work = [list(v) for v in positions]
+    isect0 = analyze_skin_anatomy_intersections(
+        skin_mesh, skin_indices=skin_indices, backend=backend, positions=work,
+        neighbors=neighbors, skin_topology=skin_topology,
+        boundary_buffer_rings=boundary_buffer_rings, verbose=verbose)
+    pen0 = analyze_skin_anatomy_penetration(
+        skin_mesh, indices=skin_indices, backend=backend, positions=work,
+        normals=normals, min_clearance=min_clearance,
+        clearance_tolerance=clearance_tolerance, detailed=True, verbose=verbose)
+    pen_repair = resolve_skin_anatomy_penetrations(
+        work, skin_indices, backend, min_clearance=min_clearance,
+        normals=normals, neighbors=neighbors,
+        max_escape_iterations=max_escape_iterations,
+        clearance_tolerance=clearance_tolerance,
+        penetration_repair_feather_rings=penetration_repair_feather_rings,
+        classifications=pen0.get("details_by_vertex"), verbose=verbose)
+    work = pen_repair["positions"]
+    isect_repair = resolve_skin_anatomy_intersections(
+        work, skin_indices, backend, skin_mesh=skin_mesh, neighbors=neighbors,
+        normals=normals, skin_topology=skin_topology, min_clearance=min_clearance,
+        clearance_tolerance=clearance_tolerance,
+        max_intersection_repair_iterations=max_intersection_repair_iterations,
+        intersection_repair_step_ratio=intersection_repair_step_ratio,
+        intersection_repair_growth_rings=intersection_repair_growth_rings,
+        boundary_buffer_rings=boundary_buffer_rings, verbose=verbose)
+    work = isect_repair["positions"]
+    isect1 = isect_repair.get("report_after") or analyze_skin_anatomy_intersections(
+        skin_mesh, skin_indices=skin_indices, backend=backend, positions=work,
+        neighbors=neighbors, skin_topology=skin_topology,
+        boundary_buffer_rings=boundary_buffer_rings, verbose=False)
+    pen1 = analyze_skin_anatomy_penetration(
+        skin_mesh, indices=skin_indices, backend=backend, positions=work,
+        normals=normals, min_clearance=min_clearance,
+        clearance_tolerance=clearance_tolerance, detailed=False, verbose=verbose)
+    return {
+        "positions": work,
+        "penetration_before": pen0,
+        "penetration_after": pen1,
+        "intersection_before": isect0,
+        "intersection_after": isect1,
+        "penetration_repair": pen_repair,
+        "intersection_repair": isect_repair,
+    }
+
+
+repair_m5_region_anatomy_conflicts = prepare_skin_region_for_smoothing
+
+
+def debug_skin_anatomy_intersection(skin_face_id, positions, backend,
+                                    skin_mesh=None, neighbors=None, normals=None,
+                                    skin_topology=None,
+                                    intersection_record=None,
+                                    min_clearance=0.8,
+                                    intersection_repair_step_ratio=DEFAULT_INTERSECTION_REPAIR_STEP_RATIO,
+                                    intersection_tolerance=DEFAULT_INTERSECTION_TOLERANCE,
+                                    verbose=True):
+    """Diagnose one intersecting skin face and a trial outward step."""
+    if skin_topology is None and skin_mesh:
+        fn = get_mesh_fn(skin_mesh)
+        skin_topology = get_triangle_topology(fn) if fn is not None else {}
+    face_vertex_ids = (skin_topology or {}).get("face_vertex_ids") or []
+    triangles = (skin_topology or {}).get("triangles") or []
+    verts = list(face_vertex_ids[skin_face_id]) if skin_face_id < len(face_vertex_ids) else []
+    if not verts:
+        verts = []
+        for face_id, i0, i1, i2 in triangles:
+            if face_id == skin_face_id:
+                verts.extend([i0, i1, i2])
+        verts = sorted(set(verts))
+    rec = intersection_record
+    if rec is None:
+        rep = analyze_skin_anatomy_intersections(
+            skin_mesh, skin_indices=verts, backend=backend, positions=positions,
+            neighbors=neighbors, skin_topology=skin_topology,
+            detailed=True, verbose=False,
+            intersection_tolerance=intersection_tolerance)
+        details = [d for d in (rep.get("details") or [])
+                   if d.get("skin_face_id") == skin_face_id]
+        rec = details[0] if details else None
+        report_local = rep
+    else:
+        report_local = None
+    nrm_face = [0.0, 0.0, 0.0]
+    tris = [t for t in triangles if t[0] == skin_face_id]
+    for _fid, i0, i1, i2 in tris:
+        if max(i0, i1, i2) < len(positions):
+            cr = vec_cross(vec_sub(positions[i1], positions[i0]),
+                           vec_sub(positions[i2], positions[i0]))
+            nrm_face = vec_add(nrm_face, cr)
+    nrm_face = vec_normalize(nrm_face)
+    v_normals = []
+    steps = []
+    for i in verts:
+        vn = _outward_skin_normal(i, normals, positions, skin_topology)
+        v_normals.append(vn)
+        edge = _mean_local_edge(positions, neighbors, i)
+        steps.append(float(intersection_repair_step_ratio) * (edge or 1.0))
+    trial = [list(p) for p in positions]
+    for i, vn, st in zip(verts, v_normals, steps):
+        trial[i] = vec_add(trial[i], vec_scale(vn, st))
+    after = analyze_skin_anatomy_intersections(
+        skin_mesh, skin_indices=verts, backend=backend, positions=trial,
+        neighbors=neighbors, skin_topology=skin_topology,
+        detailed=False, verbose=False,
+        intersection_tolerance=intersection_tolerance)
+    still = skin_face_id in (after.get("intersecting_skin_faces") or [])
+    info = {
+        "skin_face_id": skin_face_id,
+        "skin_face_vertices": verts,
+        "anatomy_mesh": rec.get("anatomy_mesh") if rec else None,
+        "anatomy_face_id": rec.get("anatomy_face_id") if rec else None,
+        "classification": rec.get("classification") if rec else None,
+        "intersection_point": rec.get("point") if rec else None,
+        "skin_face_normal": nrm_face,
+        "skin_vertex_normals": v_normals,
+        "local_edge_steps": steps,
+        "trial_still_intersecting": still,
+        "pairs_after_trial": after.get("intersection_pair_count", 0),
+        "record": rec,
+        "local_report": report_local,
+    }
+    if verbose:
+        print("[debug isect face {0}] verts={1}".format(skin_face_id, verts))
+        print("  anatomy mesh/face = {0} / {1}".format(
+            info["anatomy_mesh"], info["anatomy_face_id"]))
+        print("  classification    = {0}".format(info["classification"]))
+        print("  point             = {0}".format(info["intersection_point"]))
+        print("  skin face normal  = {0}".format(
+            [round(x, 5) for x in nrm_face] if nrm_face else None))
+        print("  trial step ratio  = {0}  still_intersecting={1}".format(
+            intersection_repair_step_ratio, still))
+    return info
+
+
+def create_intersection_debug_markers(records, prefix=DEBUG_ISECT_PREFIX):
+    """Optional locators at intersection points. Off by default in analyzers."""
+    if not records:
+        return []
+    try:
+        import maya.cmds as cmds
+    except ImportError:
+        return []
+    created = []
+    for k, rec in enumerate(records):
+        pt = rec.get("point") if isinstance(rec, dict) else None
+        if not pt:
+            continue
+        name = "{0}{1}".format(prefix, k)
+        if cmds.objExists(name):
+            cmds.delete(name)
+        loc = cmds.spaceLocator(name=name)[0]
+        cmds.xform(loc, ws=True, t=(pt[0], pt[1], pt[2]))
+        created.append(loc)
+    print("[intersection] created {0} debug locators ({1}*)".format(
+        len(created), prefix))
+    return created
+
+
+def cleanup_intersection_debug_markers(prefix=DEBUG_ISECT_PREFIX):
+    try:
+        import maya.cmds as cmds
+    except ImportError:
+        return
+    hits = cmds.ls(prefix + "*", type="transform") or []
+    if hits:
+        cmds.delete(hits)
+        print("[intersection] deleted {0} debug locators".format(len(hits)))
