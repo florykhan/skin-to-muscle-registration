@@ -3004,3 +3004,440 @@ def summarize_skin_sdf_values(skin_mesh: str,
     print("[artifact_detection][M4]   suggested global target_offset candidates: "
           "median={0:.3f}, p25={1:.3f}, p75={2:.3f}".format(p[50], p[25], p[75]))
     return result
+
+
+# =============================================================================
+# M5 - Unified Multi-Scale + SDF Artifact Detection
+# =============================================================================
+# WHY M5 FUSES M3 AND M4 (complementary artifact evidence)
+# --------------------------------------------------------
+# M3 (multi-scale, boundary-aware Laplacian -- the interpretable V1 detector)
+# answers a LOCAL / GEOMETRIC question:
+#       "Is the skin locally / multi-scale geometrically abnormal?"
+# It is sensitive to sharp, localised defects (spikes, dents, folds) but can miss
+# broad, smooth drift and still responds to some valid high-curvature anatomy.
+#
+# M4 (SDF-reference Laplacian) answers an ANATOMY-RELATIVE question:
+#       "Does the skin disagree with an anatomy-derived reference offset surface?"
+# It is sensitive to broad / relatively smooth disagreement with the underlying
+# muscles/fat/bone, but it does not flag every locally irregular vertex.
+#
+# These are DIFFERENT, complementary questions, so M5 keeps them SEPARATE and
+# INTERPRETABLE rather than collapsing them into another opaque weighted score.
+# It runs each detector ONCE, fuses their candidate SETS, and preserves the
+# overlap / M3-only / M4-only / union breakdown so a human can see *why* a vertex
+# was flagged:
+#
+#     overlap  = M3 & M4   -> both geometry AND anatomy agree (high confidence)
+#     m3_only  = M3 - M4   -> locally irregular, weak anatomy support (sharp bumps)
+#     m4_only  = M4 - M3   -> anatomy disagreement, locally smooth (broad drift)
+#     union    = M3 | M4   -> maximum-recall candidate set
+#
+# EVIDENCE, NOT ACCURACY: M5 is designed to COMBINE COMPLEMENTARY artifact
+# evidence. No claim is made that it is "more accurate" than M3 or M4 until it is
+# evaluated visually. Do NOT read a larger count as "better".
+#
+# SIGNED vs UNSIGNED: M4's SDF backend here is UNSIGNED (see the M4 section), so
+# M4/M5 provide anatomy-aware REFERENCE information; they do NOT guarantee
+# penetration detection. Penetration must be evaluated separately with signed
+# inside/outside information or the existing collision system.
+#
+# NO DOUBLE POST-PROCESSING: M3 and M4 are each called ONCE with
+# ``final_growth_rings=0`` and ``select=False``, so their own (milestone-defining)
+# boundary exclusion and small-component filtering still run, but region GROWTH
+# happens only ONCE -- in M5's shared final cleanup after fusion. M5 is DETECTION
+# ONLY: it never moves vertices, never edits topology, and never creates geometry.
+#
+# COST: cost(M3) + cost(M4) + O(V + E) for fusion / topology filtering. M4 is the
+# expensive part and is computed exactly once; every report category is derived
+# from the two returned index sets (M4 is never recomputed for the breakdown).
+
+_M5_FUSION_MODES = ("union", "intersection", "m3_only", "m4_only")
+
+
+def detect_unified_artifacts(skin_mesh: str,
+                             anatomical_meshes: Optional[Sequence[str]],
+                             target_offset: float,
+                             # --- M3 (multi-scale geometry) configuration ------
+                             m3_scales: Sequence[int] = (1, 2, 3),
+                             m3_method: str = "percentile",
+                             m3_percentile: float = 97.5,
+                             m3_normalize: bool = True,
+                             m3_aggregation: str = "persistence",
+                             m3_min_persistent_scales: int = 2,
+                             m3_boundary_buffer_rings: int = 1,
+                             m3_min_component_size: int = 5,
+                             # --- M4 (anatomy SDF reference) configuration -----
+                             m4_method: str = "percentile",
+                             m4_percentile: float = 97.5,
+                             m4_normalize: bool = True,
+                             m4_boundary_buffer_rings: int = 1,
+                             m4_min_component_size: int = 3,
+                             # --- fusion --------------------------------------
+                             fusion_mode: str = "union",
+                             # --- shared final cleanup ------------------------
+                             exclude_boundaries: bool = True,
+                             final_boundary_buffer_rings: int = 1,
+                             min_final_component_size: int = 3,
+                             final_growth_rings: int = 1,
+                             reapply_boundary_exclusion_after_growth: bool = True,
+                             select: bool = True,
+                             ) -> Tuple[List[int], Dict[str, Any]]:
+    """M5: unified detector fusing M3 (geometry) and M4 (anatomy SDF) evidence.
+
+    M5 is the FINAL INTEGRATION of the two strongest, complementary research
+    directions rather than an independent detector:
+
+    * **M3 contributes local / multi-scale GEOMETRIC evidence** -- it flags
+      vertices that are geometrically abnormal across neighbourhood scales
+      (spikes, dents, folds). Provided by :func:`detect_multiscale_irregular_region`
+      (the interpretable M3 V1 detector; M3 V2's experimental hybrid score is
+      intentionally NOT used as the default geometry signal).
+    * **M4 contributes anatomy-derived REFERENCE evidence** -- it flags vertices
+      whose local shape disagrees with an anatomy-derived offset surface
+      ``phi(x) = target_offset``. Provided by :func:`detect_sdf_reference_artifacts`.
+
+    The two detectors answer different questions, so M5 fuses their candidate
+    SETS (not their scores) and keeps the overlap / M3-only / M4-only / union
+    breakdown for interpretation. This design deliberately avoids introducing
+    arbitrary M3/M4 numeric weights; any weighted fusion would be a separate,
+    explicit experiment.
+
+    Pipeline (detection only)::
+
+        run M3 once  (select=False, final_growth_rings=0)   -> m3 candidate set
+        run M4 once  (select=False, final_growth_rings=0)   -> m4 candidate set
+        fuse sets by ``fusion_mode``                        -> fused
+        shared boundary exclusion (+ buffer)                -> remove rim vertices
+        connected-component filtering (< min size dropped)
+        ONE final region growth (+ ``final_growth_rings``)
+        REAPPLY boundary exclusion after growth (rim can regrow)
+        (optionally) select the final region in Maya
+
+    Parameters
+    ----------
+    skin_mesh:
+        Registered skin mesh to analyse (NOT modified, NOT renamed).
+    anatomical_meshes:
+        Internal anatomy names for the M4 SDF reference (e.g. ``INTERNAL_MESHES``).
+    target_offset:
+        REQUIRED anatomy offset ``d0`` for M4's iso-surface ``phi(x) = d0``. Choose
+        it from the scene scale via :func:`summarize_skin_sdf_values` -- it is NOT
+        guessed. Passing ``None`` raises ``ValueError``.
+    m3_* :
+        Forwarded to :func:`detect_multiscale_irregular_region`.
+    m4_* :
+        Forwarded to :func:`detect_sdf_reference_artifacts`.
+    fusion_mode:
+        One of ``{"union", "intersection", "m3_only", "m4_only"}``. Default
+        ``"union"`` (maximum recall). ``"intersection"`` yields the
+        high-confidence overlap. Intersection is NOT assumed to be better.
+    exclude_boundaries, final_boundary_buffer_rings,
+    min_final_component_size, final_growth_rings,
+    reapply_boundary_exclusion_after_growth:
+        Shared final-cleanup knobs applied ONCE to the fused set (see pipeline).
+    select:
+        If True, select the final M5 region in Maya for inspection.
+
+    Returns
+    -------
+    (final_indices, report):
+        ``final_indices`` is the deterministic sorted vertex list for the chosen
+        ``fusion_mode`` after shared cleanup. ``report`` is a dict preserving the
+        M3/M4 sub-reports and the overlap/M3-only/M4-only/union breakdown (see the
+        keys built below). Index collections are sorted for determinism.
+
+    Raises
+    ------
+    ValueError
+        If ``fusion_mode`` is unknown, ``target_offset`` is ``None``, or a
+        cleanup parameter is out of range.
+    """
+    # --- validate M5-owned parameters (M3/M4 validate their own) --------------
+    if fusion_mode not in _M5_FUSION_MODES:
+        raise ValueError("fusion_mode must be one of {0}, got '{1}'".format(
+            _M5_FUSION_MODES, fusion_mode))
+    if target_offset is None:
+        raise ValueError(
+            "target_offset is REQUIRED for M5 (used by the M4 SDF stage) and is "
+            "not guessed. Run summarize_skin_sdf_values(...) first and pass e.g. "
+            "the observed median distance.")
+    if min_final_component_size < 1:
+        raise ValueError("min_final_component_size must be >= 1, got {0}".format(
+            min_final_component_size))
+    if final_growth_rings < 0:
+        raise ValueError("final_growth_rings must be >= 0, got {0}".format(
+            final_growth_rings))
+    if final_boundary_buffer_rings < 0:
+        raise ValueError("final_boundary_buffer_rings must be >= 0, got {0}".format(
+            final_boundary_buffer_rings))
+
+    warnings: List[str] = []
+
+    def _empty_report() -> Dict[str, Any]:
+        return {
+            "mesh": skin_mesh,
+            "fusion_mode": fusion_mode,
+            "target_offset": target_offset,
+            "m3": {"count": 0, "report": {}},
+            "m4": {"count": 0, "report": {}},
+            "m3_indices": [], "m4_indices": [],
+            "overlap_indices": [], "overlap_count": 0,
+            "m3_only_indices": [], "m3_only_count": 0,
+            "m4_only_indices": [], "m4_only_count": 0,
+            "union_indices": [], "union_count": 0,
+            "fused_count_before_final_filtering": 0,
+            "boundary_excluded_count": 0,
+            "components_before_filtering": 0,
+            "components_after_filtering": 0,
+            "final_count_before_growth": 0,
+            "final_indices": [], "final_count": 0,
+            "warnings": warnings,
+        }
+
+    if not mesh_utils.mesh_exists(skin_mesh):
+        print("[artifact_detection][M5] skin mesh '{0}' does not exist".format(skin_mesh))
+        warnings.append("skin mesh missing")
+        return [], _empty_report()
+
+    # --- 1. run M3 ONCE (geometry evidence); no growth, no selection ---------
+    # final_growth_rings=0 so growth happens only once, later, on the fused set.
+    print("[artifact_detection][M5] --- M3 (multi-scale geometry) ---")
+    m3_indices, m3_report = detect_multiscale_irregular_region(
+        skin_mesh,
+        scales=m3_scales,
+        method=m3_method,
+        percentile=m3_percentile,
+        normalize=m3_normalize,
+        aggregation=m3_aggregation,
+        min_persistent_scales=m3_min_persistent_scales,
+        exclude_boundaries=exclude_boundaries,
+        boundary_buffer_rings=m3_boundary_buffer_rings,
+        min_component_size=m3_min_component_size,
+        final_growth_rings=0,
+        select=False,
+    )
+
+    # --- 2. run M4 ONCE (anatomy reference evidence); no growth, no selection -
+    print("[artifact_detection][M5] --- M4 (anatomy SDF reference) ---")
+    m4_indices, m4_report = detect_sdf_reference_artifacts(
+        skin_mesh,
+        anatomical_meshes,
+        target_offset,
+        method=m4_method,
+        percentile=m4_percentile,
+        normalize=m4_normalize,
+        exclude_boundaries=exclude_boundaries,
+        boundary_buffer_rings=m4_boundary_buffer_rings,
+        min_component_size=m4_min_component_size,
+        final_growth_rings=0,
+        reapply_boundary_exclusion_after_growth=False,  # no growth here => N/A
+        select=False,
+    )
+    for w in m4_report.get("warnings", []):
+        warnings.append("M4: {0}".format(w))
+
+    # --- 3. confidence categories (derived from the two sets; M4 not rerun) --
+    m3_set = set(m3_indices)
+    m4_set = set(m4_indices)
+    overlap = m3_set & m4_set
+    m3_only = m3_set - m4_set
+    m4_only = m4_set - m3_set
+    union = m3_set | m4_set
+
+    # --- 4. fuse candidate sets by mode --------------------------------------
+    if fusion_mode == "union":
+        fused = set(union)
+    elif fusion_mode == "intersection":
+        fused = set(overlap)
+    elif fusion_mode == "m3_only":
+        fused = set(m3_only)
+    else:  # "m4_only"
+        fused = set(m4_only)
+    fused_count_before_final_filtering = len(fused)
+    if not fused:
+        warnings.append(
+            "fused candidate set is empty for fusion_mode='{0}'".format(fusion_mode))
+
+    # --- 5. shared final cleanup (ONE growth; boundary handled before & after)-
+    adjacency = mesh_utils.get_vertex_neighbors(skin_mesh)
+    if not adjacency:
+        warnings.append("could not read topology; skipped component filter/growth")
+
+    # 5a-b. identify true boundary vertices (+ optional buffer) once.
+    boundary: Set[int] = set()
+    if exclude_boundaries:
+        boundary = set(find_skin_boundary_vertices(
+            skin_mesh, buffer_rings=final_boundary_buffer_rings))
+
+    # 5c. remove boundary from the fused set.
+    fused_no_boundary = sorted(fused - boundary)
+    boundary_excluded_count = len(fused) - len(fused_no_boundary)
+
+    # 5d. connected components; drop those smaller than min_final_component_size.
+    if adjacency:
+        filtered, comp_stats = filter_small_components(
+            fused_no_boundary, adjacency, min_final_component_size)
+        components_before_filtering = comp_stats["components_before"]
+        components_after_filtering = comp_stats["components_after"]
+    else:
+        filtered = list(fused_no_boundary)
+        components_before_filtering = 0
+        components_after_filtering = 0
+    final_count_before_growth = len(filtered)
+
+    # 5e. ONE final region growth.
+    if adjacency and final_growth_rings > 0 and filtered:
+        grown = mesh_utils.grow_indices(adjacency, filtered, rings=final_growth_rings)
+    else:
+        grown = sorted(filtered)
+
+    # 5f. REAPPLY boundary exclusion after growth (growth can re-touch a rim).
+    if exclude_boundaries and reapply_boundary_exclusion_after_growth and boundary:
+        grown = [i for i in grown if i not in boundary]
+
+    final_indices = sorted(grown)
+
+    # --- 6. assemble report (sorted collections for determinism) -------------
+    report: Dict[str, Any] = {
+        "mesh": skin_mesh,
+        "fusion_mode": fusion_mode,
+        "target_offset": target_offset,
+        "m3": {"count": len(m3_set), "report": m3_report},
+        "m4": {"count": len(m4_set), "report": m4_report},
+        "m3_indices": sorted(m3_set),
+        "m4_indices": sorted(m4_set),
+        "overlap_indices": sorted(overlap),
+        "overlap_count": len(overlap),
+        "m3_only_indices": sorted(m3_only),
+        "m3_only_count": len(m3_only),
+        "m4_only_indices": sorted(m4_only),
+        "m4_only_count": len(m4_only),
+        "union_indices": sorted(union),
+        "union_count": len(union),
+        "fused_count_before_final_filtering": fused_count_before_final_filtering,
+        "boundary_excluded_count": boundary_excluded_count,
+        "components_before_filtering": components_before_filtering,
+        "components_after_filtering": components_after_filtering,
+        "final_count_before_growth": final_count_before_growth,
+        "final_indices": final_indices,
+        "final_count": len(final_indices),
+        "warnings": warnings,
+    }
+
+    # --- 7. concise report ---------------------------------------------------
+    print("[artifact_detection][M5] '{0}' fusion='{1}' | M3={2} M4={3} | "
+          "overlap={4} m3_only={5} m4_only={6} union={7}".format(
+              skin_mesh, fusion_mode, len(m3_set), len(m4_set),
+              len(overlap), len(m3_only), len(m4_only), len(union)))
+    print("[artifact_detection][M5] fused {0} -> boundary-excluded {1} -> "
+          "components {2}->{3} (< {4} dropped) -> {5} verts -> final {6} "
+          "(+{7} growth ring(s))".format(
+              fused_count_before_final_filtering, boundary_excluded_count,
+              components_before_filtering, components_after_filtering,
+              min_final_component_size, final_count_before_growth,
+              report["final_count"], final_growth_rings))
+    if warnings:
+        print("[artifact_detection][M5] warnings: {0}".format("; ".join(warnings)))
+
+    # --- 8. optional selection (DETECTION ONLY -- geometry never changes) -----
+    if select and final_indices:
+        select_vertices(skin_mesh, final_indices)
+        print("[artifact_detection][M5] selected {0} vertices for inspection "
+              "(mesh unchanged)".format(len(final_indices)))
+
+    return final_indices, report
+
+
+def select_m5_category(skin_mesh: str,
+                       m5_report: Dict[str, Any],
+                       category: str = "final",
+                       ) -> List[int]:
+    """Select ONE M5 evidence category in Maya for visual inspection.
+
+    Lets you flip a viewport selection between the interpretable M5 categories
+    without re-running detection. Uses the index lists already stored in a report
+    returned by :func:`detect_unified_artifacts`; it never edits geometry.
+
+    Parameters
+    ----------
+    skin_mesh:
+        Mesh to select on (not modified).
+    m5_report:
+        A report dict from :func:`detect_unified_artifacts`.
+    category:
+        One of ``"m3"``, ``"m4"``, ``"overlap"``, ``"m3_only"``, ``"m4_only"``,
+        ``"union"``, ``"final"``.
+
+    Returns
+    -------
+    list[int]
+        The (sorted) indices that were selected (possibly empty).
+
+    Raises
+    ------
+    ValueError
+        If ``category`` is not one of the supported names.
+    """
+    key_map = {
+        "m3": "m3_indices",
+        "m4": "m4_indices",
+        "overlap": "overlap_indices",
+        "m3_only": "m3_only_indices",
+        "m4_only": "m4_only_indices",
+        "union": "union_indices",
+        "final": "final_indices",
+    }
+    if category not in key_map:
+        raise ValueError("category must be one of {0}, got '{1}'".format(
+            sorted(key_map), category))
+    indices = sorted(m5_report.get(key_map[category], []))
+    if not indices:
+        print("[artifact_detection][M5] category '{0}' has 0 vertices".format(category))
+        return []
+    select_vertices(skin_mesh, indices)
+    print("[artifact_detection][M5] selected {0} vertices for category '{1}' "
+          "(mesh unchanged)".format(len(indices), category))
+    return indices
+
+
+def compare_m3_m4_m5(m5_report: Dict[str, Any],
+                     verbose: bool = True,
+                     ) -> Dict[str, Any]:
+    """Cross-tabulate M3, M4 and the final M5 set from a single M5 report.
+
+    Reuses the index lists already computed by :func:`detect_unified_artifacts`
+    (no detector is re-run), so this is O(V) set arithmetic. Reports counts and
+    pairwise intersections. Higher counts are NOT interpreted as "better" -- the
+    primary evaluation remains visual / anatomical.
+
+    Returns
+    -------
+    dict
+        ``{"m3_count", "m4_count", "m5_count", "m3_and_m4", "m3_and_m5",
+           "m4_and_m5", "only_m3", "only_m4", "fusion_mode"}``.
+    """
+    m3 = set(m5_report.get("m3_indices", []))
+    m4 = set(m5_report.get("m4_indices", []))
+    m5 = set(m5_report.get("final_indices", []))
+    result = {
+        "fusion_mode": m5_report.get("fusion_mode"),
+        "m3_count": len(m3),
+        "m4_count": len(m4),
+        "m5_count": len(m5),
+        "m3_and_m4": len(m3 & m4),
+        "m3_and_m5": len(m3 & m5),
+        "m4_and_m5": len(m4 & m5),
+        "only_m3": len(m3 - m4),
+        "only_m4": len(m4 - m3),
+    }
+    if verbose:
+        print("[artifact_detection][M5] compare (fusion='{0}'):".format(result["fusion_mode"]))
+        print("  counts     : M3={0}  M4={1}  M5={2}".format(
+            result["m3_count"], result["m4_count"], result["m5_count"]))
+        print("  intersect  : M3&M4={0}  M3&M5={1}  M4&M5={2}".format(
+            result["m3_and_m4"], result["m3_and_m5"], result["m4_and_m5"]))
+        print("  exclusive  : only-M3={0}  only-M4={1}".format(
+            result["only_m3"], result["only_m4"]))
+        print("  (higher count != better; evaluate visually)")
+    return result

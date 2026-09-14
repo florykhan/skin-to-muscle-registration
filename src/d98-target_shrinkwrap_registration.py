@@ -2987,6 +2987,126 @@ def compare_m2_m4_skin_artifacts(skin_mesh=None, provided_target_mesh=None,
         percentile=percentile, **kwargs)
 
 
+# --- M5: unified M3 (multi-scale geometry) + M4 (anatomy SDF) detector --------
+# Thin wrappers only. All fusion / boundary / component logic lives in
+# artifact_detection.detect_unified_artifacts; nothing is duplicated here.
+
+def detect_m5_skin_artifacts(skin_mesh=None, anatomical_meshes=None,
+                             target_offset=None, fusion_mode="union",
+                             m3_scales=(1, 2, 3), m3_method="percentile",
+                             m3_percentile=97.5, m3_normalize=True,
+                             m3_aggregation="persistence",
+                             m3_min_persistent_scales=2,
+                             m3_boundary_buffer_rings=1, m3_min_component_size=5,
+                             m4_method="percentile", m4_percentile=97.5,
+                             m4_normalize=True, m4_boundary_buffer_rings=1,
+                             m4_min_component_size=3,
+                             exclude_boundaries=True,
+                             final_boundary_buffer_rings=1,
+                             min_final_component_size=3, final_growth_rings=1,
+                             reapply_boundary_exclusion_after_growth=True,
+                             select=True):
+    """M5 (FINAL) detector: unified M3 (multi-scale geometry) + M4 (anatomy SDF).
+
+    Thin delegate to artifact_detection.detect_unified_artifacts. Runs M3 and M4
+    each ONCE, fuses their candidate sets (default fusion_mode='union'), and keeps
+    the overlap / M3-only / M4-only / union breakdown in the returned report. M4's
+    SDF backend is injected from THIS script so M5 uses the registration's exact
+    distance field. DETECTION ONLY -- never moves vertices, never smooths, never
+    creates geometry. Returns ``(final_indices, report)``.
+
+    ``target_offset`` is REQUIRED (not guessed): run
+    ``summarize_skin_anatomy_distances()`` first and pass e.g. the observed median.
+    """
+    if not _configure_m4_sdf_backend():
+        return
+    skin_mesh = skin_mesh or SKIN_MESH
+    anatomical_meshes = anatomical_meshes or INTERNAL_MESHES
+    if target_offset is None:
+        print("[M5] target_offset is REQUIRED (used by the M4 SDF stage). Run "
+              "summarize_skin_anatomy_distances() first, then pass e.g. "
+              "target_offset=<observed median>.")
+        return [], {}
+    return artifact_detection.detect_unified_artifacts(
+        skin_mesh, anatomical_meshes, target_offset,
+        m3_scales=m3_scales, m3_method=m3_method, m3_percentile=m3_percentile,
+        m3_normalize=m3_normalize, m3_aggregation=m3_aggregation,
+        m3_min_persistent_scales=m3_min_persistent_scales,
+        m3_boundary_buffer_rings=m3_boundary_buffer_rings,
+        m3_min_component_size=m3_min_component_size,
+        m4_method=m4_method, m4_percentile=m4_percentile,
+        m4_normalize=m4_normalize,
+        m4_boundary_buffer_rings=m4_boundary_buffer_rings,
+        m4_min_component_size=m4_min_component_size,
+        fusion_mode=fusion_mode, exclude_boundaries=exclude_boundaries,
+        final_boundary_buffer_rings=final_boundary_buffer_rings,
+        min_final_component_size=min_final_component_size,
+        final_growth_rings=final_growth_rings,
+        reapply_boundary_exclusion_after_growth=reapply_boundary_exclusion_after_growth,
+        select=select)
+
+
+def select_m5_category(m5_report, category="final", skin_mesh=None):
+    """Select ONE M5 evidence category in the viewport for visual inspection.
+
+    ``category`` is one of 'm3', 'm4', 'overlap', 'm3_only', 'm4_only', 'union',
+    'final'. Thin delegate to artifact_detection.select_m5_category; never edits
+    geometry. Pass the ``report`` returned by :func:`detect_m5_skin_artifacts`.
+    """
+    if not _helpers_ready():
+        return
+    skin_mesh = skin_mesh or SKIN_MESH
+    return artifact_detection.select_m5_category(skin_mesh, m5_report, category)
+
+
+def compare_m3_m4_m5(m5_report):
+    """Print/return M3 vs M4 vs final-M5 counts and intersections (no re-run).
+
+    Thin delegate to artifact_detection.compare_m3_m4_m5 using the index sets
+    already stored in an M5 report. Higher counts are NOT automatically better;
+    the primary evaluation remains visual / anatomical.
+    """
+    if not _helpers_ready():
+        return
+    return artifact_detection.compare_m3_m4_m5(m5_report)
+
+
+def smooth_m5_region(indices, strength=0.3, iterations=5, method="taubin",
+                     grow=0, mesh_name=None, export_csv=None):
+    """Smooth an M5-detected region using the EXISTING localized smoother.
+
+    This is the explicit SECOND step after detection -- M5 detection never smooths
+    automatically (essential for research reproducibility). Reuses
+    ``smoothing_utils.smooth_mesh_region`` (region-aware Taubin/Laplacian; the
+    unselected neighbours are frozen references so the patch blends in) and reports
+    before/after displacement via ``metrics_utils``. No new smoothing/metrics code.
+    The mesh NAME is preserved.
+
+    Parameters
+    ----------
+    indices : list[int] or dict
+        Vertices to smooth. Pass the M5 ``final_indices`` list, or an M5 ``report``
+        dict (its ``final_indices`` are used).
+    strength, iterations, method, grow, mesh_name, export_csv:
+        As in :func:`cleanup_selected_region` (small iteration/strength sweeps are
+        recommended -- start at iterations=1..5, strength~0.3).
+    """
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    # Accept either a raw index list or a full M5 report dict.
+    if isinstance(indices, dict):
+        indices = indices.get("final_indices", [])
+    indices = list(indices)
+    if not indices:
+        print("[M5] no vertices to smooth (empty M5 region).")
+        return
+    if grow > 0:
+        indices = region_selection.grow_region(mesh_name, indices, rings=grow)
+    return _run_region_cleanup(mesh_name, indices, strength, iterations,
+                               method, export_csv, label="m5")
+
+
 def backup_skin_mesh(suffix="_precleanup"):
     """Duplicate the skin mesh as a backup before cleanup (name preserved)."""
     if not _helpers_ready():
@@ -3014,6 +3134,10 @@ if HELPERS_AVAILABLE:
     print("  detect_hybrid_skin_artifacts()                        - M3 V2 hybrid geo+anatomy detect (exp.)")
     print("  summarize_skin_anatomy_distances()                    - M4 pick target_offset from scene scale")
     print("  detect_sdf_reference_skin_artifacts(target_offset=..) - M4 SDF-reference detect (anatomy-derived)")
+    print("  detect_m5_skin_artifacts(target_offset=..)            - M5 UNIFIED M3+M4 fusion detect (FINAL)")
+    print("  select_m5_category(m5_report, 'overlap')              - M5 view a category (m3/m4/overlap/union..)")
+    print("  compare_m3_m4_m5(m5_report)                            - M5 count/overlap comparison (no re-run)")
+    print("  smooth_m5_region(m5_idx, iterations=5)                - M5 smooth a detected region (explicit)")
     print("  cleanup_selected_region(strength=0.3, iterations=8)   - smooth viewport selection")
     print("  cleanup_named_region('lips', strength=0.3)            - smooth heuristic region")
     print("  backup_skin_mesh()                                    - duplicate skin before edits")
