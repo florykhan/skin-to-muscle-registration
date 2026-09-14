@@ -73,11 +73,13 @@ HELPER_SRC_DIR = r"/Users/florykhan/Documents/Projects/Research Projects/skin-to
 # Verbose diagnostics for the bootstrap (set False once it works if you like).
 HELPER_DEBUG = True
 
-# Order matters: modules that import siblings must come AFTER them. In
-# particular artifact_detection imports mesh_utils + region_selection, so it is
-# loaded last.
+# Order matters: modules that import siblings must come AFTER them.
+# artifact_detection imports mesh_utils + region_selection; cleanup_pipeline
+# imports artifact_detection + smoothing_utils + metrics_utils + maya_io, so it
+# is loaded last.
 HELPER_MODULES = ("mesh_utils", "smoothing_utils", "region_selection",
-                  "metrics_utils", "maya_io", "artifact_detection")
+                  "metrics_utils", "maya_io", "artifact_detection",
+                  "cleanup_pipeline")
 HELPERS_AVAILABLE = False
 
 # Placeholders so these names always exist (reassigned to real modules on load).
@@ -87,6 +89,7 @@ region_selection = None
 metrics_utils = None
 maya_io = None
 artifact_detection = None
+cleanup_pipeline = None
 
 
 def _dir_has_helpers(d):
@@ -3107,6 +3110,68 @@ def smooth_m5_region(indices, strength=0.3, iterations=5, method="taubin",
                                method, export_csv, label="m5")
 
 
+def run_m5_iterative_cleanup(target_offset=None, skin_mesh=None,
+                             anatomical_meshes=None,
+                             fusion_mode="union", m3_percentile=97.5,
+                             m4_percentile=96.0, final_growth_rings=1,
+                             smoothing_method="taubin", smoothing_strength=0.3,
+                             smoothing_iterations_per_cycle=3,
+                             max_cycles=10, min_cycles=1,
+                             convergence_patience=2,
+                             min_relative_selection_change=0.02,
+                             stable_jaccard_threshold=0.98,
+                             min_cycle_mean_displacement=1e-5,
+                             max_cumulative_displacement=None,
+                             stop_if_new_detection_fraction_exceeds=None,
+                             create_backup=True, log_path=None,
+                             save_json=True, save_csv=True,
+                             select_final=True, verbose=True, apply=True,
+                             m5_detector_kwargs=None):
+    """FINAL closed-loop cleanup: iterative M5 detect -> smooth -> re-detect.
+
+    Thin delegate to ``cleanup_pipeline.run_iterative_m5_cleanup``. Injects THIS
+    script's SDF backend (so M5's M4 stage uses the registration's exact field),
+    defaults skin/anatomy to SKIN_MESH / INTERNAL_MESHES, and REQUIRES
+    ``target_offset`` (run ``summarize_skin_anatomy_distances()`` first). One outer
+    cycle = ``smoothing_iterations_per_cycle`` localized smoothing passes + ONE M5
+    re-detection; detector parameters are FIXED across cycles. Uses ``apply=False``
+    for a safe dry run (baseline + plan only). Returns the full cleanup report.
+
+    All loop / convergence / logging logic lives in cleanup_pipeline; nothing is
+    duplicated here.
+    """
+    if not _helpers_ready():
+        return
+    if cleanup_pipeline is None:
+        print("[M5] cleanup_pipeline helper not loaded; re-send d98 to reload helpers.")
+        return
+    if not _configure_m4_sdf_backend():
+        return
+    skin_mesh = skin_mesh or SKIN_MESH
+    anatomical_meshes = anatomical_meshes or INTERNAL_MESHES
+    if target_offset is None:
+        print("[M5] target_offset is REQUIRED (used by the M4 SDF stage). Run "
+              "summarize_skin_anatomy_distances() first, then pass e.g. "
+              "target_offset=<observed median>.")
+        return
+    return cleanup_pipeline.run_iterative_m5_cleanup(
+        skin_mesh, anatomical_meshes, target_offset,
+        fusion_mode=fusion_mode, m3_percentile=m3_percentile,
+        m4_percentile=m4_percentile, final_growth_rings=final_growth_rings,
+        smoothing_method=smoothing_method, smoothing_strength=smoothing_strength,
+        smoothing_iterations_per_cycle=smoothing_iterations_per_cycle,
+        max_cycles=max_cycles, min_cycles=min_cycles,
+        convergence_patience=convergence_patience,
+        min_relative_selection_change=min_relative_selection_change,
+        stable_jaccard_threshold=stable_jaccard_threshold,
+        min_cycle_mean_displacement=min_cycle_mean_displacement,
+        max_cumulative_displacement=max_cumulative_displacement,
+        stop_if_new_detection_fraction_exceeds=stop_if_new_detection_fraction_exceeds,
+        create_backup=create_backup, log_path=log_path, save_json=save_json,
+        save_csv=save_csv, select_final=select_final, verbose=verbose, apply=apply,
+        m5_detector_kwargs=m5_detector_kwargs)
+
+
 def backup_skin_mesh(suffix="_precleanup"):
     """Duplicate the skin mesh as a backup before cleanup (name preserved)."""
     if not _helpers_ready():
@@ -3138,6 +3203,7 @@ if HELPERS_AVAILABLE:
     print("  select_m5_category(m5_report, 'overlap')              - M5 view a category (m3/m4/overlap/union..)")
     print("  compare_m3_m4_m5(m5_report)                            - M5 count/overlap comparison (no re-run)")
     print("  smooth_m5_region(m5_idx, iterations=5)                - M5 smooth a detected region (explicit)")
+    print("  run_m5_iterative_cleanup(target_offset=..)            - M5 CLOSED-LOOP detect->smooth->re-detect")
     print("  cleanup_selected_region(strength=0.3, iterations=8)   - smooth viewport selection")
     print("  cleanup_named_region('lips', strength=0.3)            - smooth heuristic region")
     print("  backup_skin_mesh()                                    - duplicate skin before edits")
