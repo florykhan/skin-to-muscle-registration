@@ -3110,6 +3110,162 @@ def smooth_m5_region(indices, strength=0.3, iterations=5, method="taubin",
                                method, export_csv, label="m5")
 
 
+# --- Anatomy-constrained M5 smoothing (keeps skin above fat/muscle/bone) -------
+# Thin wrappers: the constrained loop lives in smoothing_utils; the anatomy floor
+# reuses THIS script's compute_sdf_for_point + INTERNAL_MESHES + collision_min_distance.
+
+def _get_anatomy_mesh_fns(anatomical_meshes=None):
+    """Return {mesh_name: MFnMesh} for the internal anatomy.
+
+    Reuses the registration's cached handles (REG_DATA['mesh_fns']) when present,
+    otherwise builds them via get_mesh_fn. Uses the SAME anatomy set the
+    registration/collision code uses (INTERNAL_MESHES) -- no new list invented.
+    """
+    anat = anatomical_meshes or INTERNAL_MESHES
+    cached = REG_DATA.get('mesh_fns') or {}
+    fns = {}
+    for m in anat:
+        fn = cached.get(m)
+        if fn is None and cmds.objExists(m):
+            fn = get_mesh_fn(m)
+        if fn is not None:
+            fns[m] = fn
+    return fns
+
+
+def _make_anatomy_sdf_query(mesh_fns):
+    """sdf_query_fn(point) -> (distance, closest_point, outward_dir) from the
+    registration's EXACT collision field (compute_sdf_for_point, offset 0)."""
+    def _q(point):
+        sdf_val, cp, outward, _mesh = compute_sdf_for_point(point, mesh_fns, 0.0)
+        return sdf_val, cp, outward
+    return _q
+
+
+def constrained_smooth_m5_region(indices, method="laplacian", strength=0.2,
+                                 iterations=20, min_clearance=None,
+                                 target_offset=None, constraint_interval=1,
+                                 boundary_feather_rings=0, max_step_edge_ratio=None,
+                                 anatomical_meshes=None, mesh_name=None,
+                                 create_backup=True, apply=True, verbose=True,
+                                 report_interval=10, verbose_iterations=False):
+    """ANATOMY-CONSTRAINED smoothing of an M5 region (keeps skin above anatomy).
+
+    New, additive counterpart to :func:`smooth_m5_region`: same localized smoothing
+    motion, but after every smoothing step it enforces the registration's own
+    anatomical FLOOR -- vertices closer to internal anatomy than ``min_clearance``
+    are pushed back out using ``compute_sdf_for_point`` (closest point +
+    outward*clearance), exactly like the registration collision pass. Inward
+    flattening of bumps is allowed; collapsing through fat/muscle/bone is not.
+
+    ``min_clearance`` defaults to the registration's ``collision_min_distance``
+    (the existing anatomy-safe threshold). ``target_offset``/D0 is NOT an exact
+    snapping distance (skin-to-tissue distance varies across the face); it is
+    accepted for compatibility but ignored for the floor unless you explicitly pass
+    ``min_clearance=<value>``. The unconstrained :func:`smooth_m5_region` is left
+    untouched for A/B comparison. Returns the metrics dict.
+    """
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    if isinstance(indices, dict):
+        indices = indices.get("final_indices", [])
+    indices = list(indices)
+    if not indices:
+        print("[M5] no vertices to smooth (empty M5 region).")
+        return
+
+    mesh_fns = _get_anatomy_mesh_fns(anatomical_meshes)
+    if not mesh_fns:
+        print("[M5] no anatomy meshes found; cannot constrain. Check INTERNAL_MESHES.")
+        return
+
+    if min_clearance is None:
+        sw = REG_DATA.get('shrinkwrap_params')
+        min_clearance = (sw.collision_min_distance if sw is not None
+                         else ShrinkwrapParams().collision_min_distance)
+        if target_offset is not None:
+            print("[M5] note: target_offset provided but NOT used as an exact "
+                  "distance; enforcing collision_min_distance={0} as the anatomy "
+                  "floor. Pass min_clearance=<value> to override.".format(min_clearance))
+
+    sdf_query_fn = _make_anatomy_sdf_query(mesh_fns)
+
+    if create_backup and apply:
+        bk = mesh_name + "_preconstrainedsmooth"
+        if not cmds.objExists(bk):
+            maya_io.duplicate_mesh(mesh_name, suffix="_preconstrainedsmooth")
+        elif verbose:
+            print("[M5] backup '{0}' already exists; keeping it".format(bk))
+
+    opened = False
+    try:
+        cmds.undoInfo(openChunk=True, chunkName="constrained_smooth_m5")
+        opened = True
+    except Exception:
+        pass
+    try:
+        metrics = smoothing_utils.constrained_smooth_mesh_region(
+            mesh_name, indices, sdf_query_fn, min_clearance,
+            method=method, strength=strength, iterations=iterations,
+            constraint_interval=constraint_interval,
+            boundary_feather_rings=boundary_feather_rings,
+            max_step_edge_ratio=max_step_edge_ratio,
+            apply=apply, verbose=verbose, report_interval=report_interval,
+            verbose_iterations=verbose_iterations)
+    finally:
+        if opened:
+            try:
+                cmds.undoInfo(closeChunk=True)
+            except Exception:
+                pass
+    if isinstance(metrics, dict):
+        metrics["anatomy_mesh_count"] = len(mesh_fns)
+    return metrics
+
+
+def debug_anatomy_constraint_vertex(vertex_index, proposed_position=None,
+                                    min_clearance=None, mesh_name=None,
+                                    anatomical_meshes=None):
+    """Print the anatomy-constraint decision for ONE vertex (debugging helper).
+
+    Shows current position, proposed position (defaults to current), nearest anatomy
+    mesh + closest point + distance, outward push direction, and the corrected
+    (clamped) position under the collision floor.
+    """
+    if not _helpers_ready():
+        return
+    mesh_name = mesh_name or SKIN_MESH
+    verts = get_mesh_vertices(mesh_name)
+    if not verts or not (0 <= vertex_index < len(verts)):
+        print("[M5] vertex {0} out of range".format(vertex_index))
+        return
+    mesh_fns = _get_anatomy_mesh_fns(anatomical_meshes)
+    if not mesh_fns:
+        print("[M5] no anatomy meshes found")
+        return
+    if min_clearance is None:
+        sw = REG_DATA.get('shrinkwrap_params')
+        min_clearance = (sw.collision_min_distance if sw is not None
+                         else ShrinkwrapParams().collision_min_distance)
+    cur = verts[vertex_index]
+    prop = list(proposed_position) if proposed_position is not None else list(cur)
+    sdf_val, cp, outward, mesh = compute_sdf_for_point(prop, mesh_fns, 0.0)
+    constrained = (sdf_val < min_clearance)
+    safe = vec_add(cp, vec_scale(outward, min_clearance)) if constrained else prop
+    print("[debug vtx {0}] current  = {1}".format(vertex_index, [round(c, 4) for c in cur]))
+    print("  proposed      = {0}".format([round(c, 4) for c in prop]))
+    print("  nearest mesh  = {0}".format(mesh))
+    print("  closest point = {0}".format([round(c, 4) for c in cp]))
+    print("  distance      = {0:.5f}  (min_clearance={1})".format(sdf_val, min_clearance))
+    print("  outward dir   = {0}".format([round(c, 4) for c in outward]))
+    print("  constrained?  = {0}".format(constrained))
+    print("  corrected pos = {0}".format([round(c, 4) for c in safe]))
+    return {"vertex": vertex_index, "distance": sdf_val, "min_clearance": min_clearance,
+            "nearest_mesh": mesh, "closest_point": cp, "outward": outward,
+            "constrained": constrained, "corrected_position": safe}
+
+
 def run_m5_iterative_cleanup(target_offset=None, skin_mesh=None,
                              anatomical_meshes=None,
                              fusion_mode="union", m3_percentile=97.5,
@@ -3202,7 +3358,8 @@ if HELPERS_AVAILABLE:
     print("  detect_m5_skin_artifacts(target_offset=..)            - M5 UNIFIED M3+M4 fusion detect (FINAL)")
     print("  select_m5_category(m5_report, 'overlap')              - M5 view a category (m3/m4/overlap/union..)")
     print("  compare_m3_m4_m5(m5_report)                            - M5 count/overlap comparison (no re-run)")
-    print("  smooth_m5_region(m5_idx, iterations=5)                - M5 smooth a detected region (explicit)")
+    print("  smooth_m5_region(m5_idx, iterations=5)                - M5 smooth a detected region (unconstrained)")
+    print("  constrained_smooth_m5_region(m5_idx, iterations=20)   - M5 ANATOMY-CONSTRAINED smooth (safe floor)")
     print("  run_m5_iterative_cleanup(target_offset=..)            - M5 CLOSED-LOOP detect->smooth->re-detect")
     print("  cleanup_selected_region(strength=0.3, iterations=8)   - smooth viewport selection")
     print("  cleanup_named_region('lips', strength=0.3)            - smooth heuristic region")
