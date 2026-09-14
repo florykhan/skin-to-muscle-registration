@@ -237,6 +237,289 @@ def _legacy_iterative_sdf_push(point, sdf_query_fn, min_clearance, max_iters, to
     return p, False, max(1, int(max_iters)), max(0.0, min_clearance - dist)
 
 
+DEFAULT_UNSAFE_STEP_POLICY = "largest_safe_fraction"
+DEFAULT_SMOOTHING_LINE_SEARCH_STEPS = 8
+DEFAULT_MIN_SMOOTHING_ALPHA = 1e-3
+
+
+def _scale_displacement_field(before, full, alpha, indices):
+    """Return ``before + alpha * (full - before)`` on ``indices`` only."""
+    out = [list(p) for p in before]
+    a = float(alpha)
+    if a <= 0.0:
+        return out
+    if a >= 1.0:
+        for i in indices:
+            out[i] = list(full[i])
+        return out
+    for i in indices:
+        b = before[i]
+        f = full[i]
+        out[i] = [b[0] + a * (f[0] - b[0]),
+                  b[1] + a * (f[1] - b[1]),
+                  b[2] + a * (f[2] - b[2])]
+    return out
+
+
+def _smoothing_candidate_is_safe(report, baseline_faces, baseline_pair_count):
+    """True iff the candidate adds no NEW intersecting faces and does not
+    increase the local intersection-pair count vs the pre-iteration baseline.
+
+    Pre-existing intersecting faces are allowed to remain. Total count == 0
+    is NOT required.
+    """
+    faces = set(report.get("intersecting_skin_faces") or [])
+    new_faces = faces - set(baseline_faces or [])
+    pairs = int(report.get("intersection_pair_count", 0) or 0)
+    base_pairs = int(baseline_pair_count or 0)
+    if new_faces:
+        return False, new_faces
+    if pairs > base_pairs:
+        return False, new_faces
+    return True, set()
+
+
+def _find_largest_safe_smoothing_step(
+        positions_before, positions_full_proposal, moved_indices,
+        is_safe_fn, steps=DEFAULT_SMOOTHING_LINE_SEARCH_STEPS,
+        min_alpha=DEFAULT_MIN_SMOOTHING_ALPHA, project_fn=None):
+    """Binary-search the largest patch-wide alpha in [0, 1] that is safe.
+
+    ``positions_full_proposal`` is the FIXED Laplacian field for this
+    iteration (after max-step, before projection). Every candidate is
+    ``before + alpha * (full - before)``. Optional ``project_fn`` applies
+    existing clearance / segment / tangent projection AFTER the lerp and
+    BEFORE the safety test. The search origin never becomes a repaired mesh.
+
+    ``is_safe_fn(projected_positions) -> (safe: bool, extra)``
+    """
+    moved = list(moved_indices or [])
+    before = positions_before
+    full = positions_full_proposal
+    nsteps = max(1, int(steps))
+    min_a = float(min_alpha) if min_alpha is not None else 0.0
+    evaluations = 0
+
+    def _eval(alpha):
+        raw = _scale_displacement_field(before, full, alpha, moved)
+        projected = project_fn(before, raw) if project_fn is not None else raw
+        safe, extra = is_safe_fn(projected)
+        return projected, raw, bool(safe), extra
+
+    accepted, raw_full, ok, extra = _eval(1.0)
+    evaluations += 1
+    if ok:
+        return {
+            "positions": accepted,
+            "raw_positions": raw_full,
+            "alpha": 1.0,
+            "safe": True,
+            "status": "full",
+            "evaluations": evaluations,
+            "extra": extra,
+        }
+
+    lo, hi = 0.0, 1.0
+    best_alpha = 0.0
+    best_pos = [list(p) for p in before]
+    best_raw = [list(p) for p in before]
+    best_extra = extra
+    for _ in range(nsteps):
+        mid = 0.5 * (lo + hi)
+        cand, raw, ok, extra = _eval(mid)
+        evaluations += 1
+        if ok:
+            lo = mid
+            best_alpha = mid
+            best_pos = cand
+            best_raw = raw
+            best_extra = extra
+        else:
+            hi = mid
+
+    if best_alpha >= min_a:
+        status = "partial"
+        safe = True
+    else:
+        status = "stalled_no_safe_step"
+        safe = False
+        best_pos = [list(p) for p in before]
+        best_raw = [list(p) for p in before]
+        best_alpha = 0.0
+
+    return {
+        "positions": best_pos,
+        "raw_positions": best_raw,
+        "alpha": best_alpha,
+        "safe": safe,
+        "status": status,
+        "evaluations": evaluations,
+        "extra": best_extra,
+    }
+
+
+def _apply_iteration_constraints(
+        before, candidate, active, anatomy_backend, sdf_query_fn,
+        floors, min_clearance, normals, solver, use_exact, do_segment,
+        do_tangent, constrain_now, max_constraint_iterations,
+        clearance_tolerance):
+    """Existing per-vertex segment / tangent / clearance projection.
+
+    Returns ``(projected_positions, stats)``. Does not write Maya.
+    """
+    proposed = [list(p) for p in candidate]
+    stats = {
+        "segment_detected": 0,
+        "segment_prevented": 0,
+        "constraint_events": 0,
+        "constrained_vertices": set(),
+        "corrections": [],
+        "projection_steps": 0,
+        "max_proj_used": 0,
+        "unresolved": 0,
+        "normal_removed": [],
+        "tangent_kept": [],
+    }
+    for i in active:
+        floor_i = floors.get(i, min_clearance)
+        nrm = normals[i] if (normals and i < len(normals)) else None
+
+        if do_segment:
+            clamped, crossed, _hit = anatomy_constraint.clamp_segment_crossing(
+                before[i], proposed[i], anatomy_backend, min_clearance=floor_i)
+            if crossed:
+                stats["segment_detected"] += 1
+                stats["segment_prevented"] += 1
+                proposed[i] = clamped
+
+        if not constrain_now:
+            continue
+
+        if solver == "legacy_single_push":
+            dist, cp, outward = sdf_query_fn(proposed[i])
+            if dist < min_clearance:
+                safe = vec_add(list(cp), vec_scale(list(outward), min_clearance))
+                stats["corrections"].append(vec_length(vec_sub(proposed[i], safe)))
+                proposed[i] = safe
+                stats["constraint_events"] += 1
+                stats["constrained_vertices"].add(i)
+            continue
+
+        if do_tangent:
+            q_prop = anatomy_backend.exact_closest(proposed[i])
+            if not anatomy_constraint.is_clearance_satisfied(
+                    q_prop["distance"], floor_i, clearance_tolerance):
+                cand, removed, tlen, used = anatomy_constraint.tangent_preserving_proposal(
+                    before[i], proposed[i], anatomy_backend, floor_i,
+                    clearance_tolerance=clearance_tolerance)
+                if used:
+                    proposed[i] = cand
+                    stats["normal_removed"].append(removed)
+                    stats["tangent_kept"].append(tlen)
+
+        if use_exact:
+            q = anatomy_backend.exact_closest(proposed[i])
+            if anatomy_constraint.is_clearance_satisfied(
+                    q["distance"], floor_i, clearance_tolerance):
+                continue
+            sol = anatomy_constraint.enforce_anatomy_clearance(
+                proposed[i], anatomy_backend, floor_i,
+                max_constraint_iterations=max_constraint_iterations,
+                clearance_tolerance=clearance_tolerance, skin_normal=nrm)
+            corr = vec_length(vec_sub(proposed[i], sol["position"]))
+            proposed[i] = sol["position"]
+            stats["constraint_events"] += 1
+            stats["constrained_vertices"].add(i)
+            stats["corrections"].append(corr)
+            stats["projection_steps"] += sol["iterations"]
+            if sol["iterations"] > stats["max_proj_used"]:
+                stats["max_proj_used"] = sol["iterations"]
+            if sol["unresolved"]:
+                stats["unresolved"] += 1
+        else:
+            p2, ok, niter, _res = _legacy_iterative_sdf_push(
+                proposed[i], sdf_query_fn, floor_i,
+                max_constraint_iterations, clearance_tolerance)
+            corr = vec_length(vec_sub(proposed[i], p2))
+            if corr > 0.0:
+                proposed[i] = p2
+                stats["constraint_events"] += 1
+                stats["constrained_vertices"].add(i)
+                stats["corrections"].append(corr)
+                stats["projection_steps"] += niter
+                if niter > stats["max_proj_used"]:
+                    stats["max_proj_used"] = niter
+                if not ok:
+                    stats["unresolved"] += 1
+    return proposed, stats
+
+
+def _local_intersection_report(
+        mesh_name, positions, moved, anatomy_backend, neighbors, skin_topology,
+        boundary_buffer_rings, intersection_tolerance):
+    """Existing local (moved verts + 1 ring) surface-intersection query."""
+    return anatomy_constraint.analyze_skin_anatomy_intersections(
+        mesh_name, skin_indices=moved, backend=anatomy_backend,
+        positions=positions, neighbors=neighbors,
+        skin_topology=skin_topology,
+        candidate_growth_rings=1,
+        boundary_buffer_rings=boundary_buffer_rings,
+        intersection_tolerance=intersection_tolerance,
+        detailed=False, verbose=False)
+
+
+def _legacy_repair_or_rollback_intersections(
+        proposed, before_it, moved, active, anatomy_backend, mesh_name,
+        neighbors, normals, skin_topology, min_clearance, clearance_tolerance,
+        max_intersection_repair_iterations, intersection_repair_step_ratio,
+        boundary_buffer_rings, intersection_tolerance, repair_mode,
+        repair_blend_rings, repair_ring_weights, repair_binary_search,
+        max_surface_repair_passes, max_repair_displacement_ratio,
+        clearance_policy):
+    """Historical per-iteration V2-repair-then-full-rollback path.
+
+    Preserved for ``unsafe_step_policy="rollback"``. Any remaining local
+    ``intersection_pair_count > 0`` after repair rolls the iteration back.
+    Does not distinguish pre-existing vs new intersections.
+    """
+    irep = anatomy_constraint.resolve_skin_anatomy_intersections(
+        proposed, moved, anatomy_backend, skin_mesh=mesh_name,
+        neighbors=neighbors, normals=normals,
+        skin_topology=skin_topology, min_clearance=min_clearance,
+        clearance_tolerance=clearance_tolerance,
+        max_intersection_repair_iterations=min(
+            5, max_intersection_repair_iterations),
+        intersection_repair_step_ratio=intersection_repair_step_ratio,
+        intersection_repair_growth_rings=0,
+        boundary_buffer_rings=boundary_buffer_rings,
+        intersection_tolerance=intersection_tolerance,
+        binary_search_min_step=False, verbose=False,
+        repair_mode=repair_mode,
+        repair_blend_rings=min(1, int(repair_blend_rings or 0)),
+        repair_ring_weights=repair_ring_weights,
+        repair_binary_search=repair_binary_search,
+        max_surface_repair_passes=min(
+            2, int(max_surface_repair_passes or 2)),
+        max_repair_displacement_ratio=max_repair_displacement_ratio,
+        post_repair_relax=False,
+        clearance_policy=clearance_policy)
+    proposed = irep["positions"]
+    after_loc = irep.get("report_after") or {}
+    if after_loc.get("intersection_pair_count", 0) <= 0:
+        return proposed, "repaired"
+    core = anatomy_constraint.intersection_vertices_from_report(
+        after_loc, skin_topology, allowed=set(active))
+    for i in core:
+        proposed[i] = list(before_it[i])
+    still = _local_intersection_report(
+        mesh_name, proposed, moved, anatomy_backend, neighbors, skin_topology,
+        boundary_buffer_rings, intersection_tolerance)
+    if still.get("intersection_pair_count", 0) > 0:
+        for i in moved:
+            proposed[i] = list(before_it[i])
+    return proposed, "rejected"
+
+
 def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearance,
                                    method="laplacian", strength=0.2, iterations=20,
                                    constraint_interval=1, boundary_feather_rings=0,
@@ -269,7 +552,11 @@ def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearan
                                    repair_binary_search=True,
                                    max_surface_repair_passes=5,
                                    max_repair_displacement_ratio=1.0,
-                                   post_repair_relax=False):
+                                   post_repair_relax=False,
+                                   unsafe_step_policy=DEFAULT_UNSAFE_STEP_POLICY,
+                                   smoothing_line_search_steps=DEFAULT_SMOOTHING_LINE_SEARCH_STEPS,
+                                   min_smoothing_alpha=DEFAULT_MIN_SMOOTHING_ALPHA,
+                                   line_search_surface_check=True):
     """Anatomy-constrained localized smoothing (see section header).
 
     Parameters
@@ -301,6 +588,12 @@ def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearan
     apply : bool
         If True, write the result and re-read to verify it persisted.
         If False, compute metrics only -- the scene is NOT modified.
+    unsafe_step_policy : {"largest_safe_fraction", "rollback"}
+        How to respond when the FULL Laplacian proposal creates a new
+        skin/anatomy surface intersection. ``rollback`` reproduces the
+        historical all-or-nothing reject (20/20 stalled). The default
+        ``largest_safe_fraction`` binary-searches a single patch-wide alpha
+        and accepts the largest safe fraction of that same Laplacian field.
     """
     if min_clearance is None:
         raise ValueError("min_clearance is required (no world-unit default is guessed)")
@@ -308,6 +601,9 @@ def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearan
     solver = constraint_solver or "iterative_exact"
     if solver not in ("iterative_exact", "legacy_single_push"):
         raise ValueError("constraint_solver must be 'iterative_exact' or 'legacy_single_push'")
+    step_policy = unsafe_step_policy or DEFAULT_UNSAFE_STEP_POLICY
+    if step_policy not in ("largest_safe_fraction", "rollback"):
+        raise ValueError("unsafe_step_policy must be 'largest_safe_fraction' or 'rollback'")
 
     current = get_mesh_vertices(mesh_name)
     if not current:
@@ -435,6 +731,16 @@ def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearan
         "new_intersections_prevented": 0,
         "unsafe_iterations_repaired": 0,
         "unsafe_iterations_rejected": 0,
+        "full_steps_safe": 0,
+        "full_steps_unsafe": 0,
+        "partial_steps_accepted": 0,
+        "stalled_steps": 0,
+        "line_search_evaluations": 0,
+        "accepted_alpha_per_iteration": [],
+        "unsafe_full_steps_recovered_by_line_search": 0,
+        "full_step_proposed_displacements": [],
+        "partial_step_displacements": [],
+        "unsafe_step_policy": step_policy,
     }
     if anatomy_backend is not None:
         isect0 = anatomy_constraint.analyze_skin_anatomy_intersections(
@@ -509,153 +815,161 @@ def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearan
 
     for it in range(max(1, iterations)):
         before_it = [list(v) for v in work]
-        proposed = _run_smoothing(work, neighbors, method, strength, active, 1)
+        laplacian_full = _run_smoothing(work, neighbors, method, strength, active, 1)
 
         if max_step_edge_ratio is not None:
             for i in active:
                 cap = max_step_edge_ratio * local_edge.get(i, 0.0)
                 if cap <= 0:
                     continue
-                step = vec_sub(proposed[i], work[i])
+                step = vec_sub(laplacian_full[i], work[i])
                 slen = vec_length(step)
                 if slen > cap and slen > 1e-12:
-                    proposed[i] = vec_add(work[i], vec_scale(step, cap / slen))
+                    laplacian_full[i] = vec_add(work[i], vec_scale(step, cap / slen))
+
+        step_mags = [vec_length(vec_sub(laplacian_full[i], before_it[i])) for i in active]
+        isect_metrics["full_step_proposed_displacements"].append(
+            (sum(step_mags) / len(step_mags)) if step_mags else 0.0)
 
         constrain_now = constraint_interval <= 1 or (it % constraint_interval == 0)
-        for i in active:
-            floor_i = floors.get(i, min_clearance)
-            nrm = normals[i] if (normals and i < len(normals)) else None
+        moved = [i for i in active
+                 if vec_length(vec_sub(laplacian_full[i], before_it[i])) > 1e-12]
 
-            if do_segment:
-                clamped, crossed, _hit = anatomy_constraint.clamp_segment_crossing(
-                    work[i], proposed[i], anatomy_backend, min_clearance=floor_i)
-                if crossed:
-                    segment_detected += 1
-                    segment_prevented += 1
-                    proposed[i] = clamped
-
-            if not constrain_now:
-                continue
-
-            if solver == "legacy_single_push":
-                dist, cp, outward = sdf_query_fn(proposed[i])
-                if dist < min_clearance:
-                    safe = vec_add(list(cp), vec_scale(list(outward), min_clearance))
-                    corrections.append(vec_length(vec_sub(proposed[i], safe)))
-                    proposed[i] = safe
-                    constraint_events += 1
-                    constrained_vertices.add(i)
-                continue
-
-            if do_tangent:
-                q_prop = anatomy_backend.exact_closest(proposed[i])
-                if not anatomy_constraint.is_clearance_satisfied(
-                        q_prop["distance"], floor_i, clearance_tolerance):
-                    cand, removed, tlen, used = anatomy_constraint.tangent_preserving_proposal(
-                        work[i], proposed[i], anatomy_backend, floor_i,
-                        clearance_tolerance=clearance_tolerance)
-                    if used:
-                        proposed[i] = cand
-                        normal_removed.append(removed)
-                        tangent_kept.append(tlen)
-
-            if use_exact:
-                q = anatomy_backend.exact_closest(proposed[i])
-                if anatomy_constraint.is_clearance_satisfied(
-                        q["distance"], floor_i, clearance_tolerance):
-                    continue
-                sol = anatomy_constraint.enforce_anatomy_clearance(
-                    proposed[i], anatomy_backend, floor_i,
-                    max_constraint_iterations=max_constraint_iterations,
-                    clearance_tolerance=clearance_tolerance, skin_normal=nrm)
-                corr = vec_length(vec_sub(proposed[i], sol["position"]))
-                proposed[i] = sol["position"]
-                constraint_events += 1
-                constrained_vertices.add(i)
-                corrections.append(corr)
-                projection_steps += sol["iterations"]
-                if sol["iterations"] > max_proj_used:
-                    max_proj_used = sol["iterations"]
-                if sol["unresolved"]:
-                    unresolved_constraints += 1
-            else:
-                p2, ok, niter, _res = _legacy_iterative_sdf_push(
-                    proposed[i], sdf_query_fn, floor_i,
-                    max_constraint_iterations, clearance_tolerance)
-                corr = vec_length(vec_sub(proposed[i], p2))
-                if corr > 0.0:
-                    proposed[i] = p2
-                    constraint_events += 1
-                    constrained_vertices.add(i)
-                    corrections.append(corr)
-                    projection_steps += niter
-                    if niter > max_proj_used:
-                        max_proj_used = niter
-                    if not ok:
-                        unresolved_constraints += 1
+        def _project(before_pos, cand_pos):
+            return _apply_iteration_constraints(
+                before_pos, cand_pos, active, anatomy_backend, sdf_query_fn,
+                floors, min_clearance, normals, solver, use_exact, do_segment,
+                do_tangent, constrain_now, max_constraint_iterations,
+                clearance_tolerance)[0]
 
         isect_now = (do_isect_prevent and (
             surface_intersection_check_interval <= 1
             or (it % surface_intersection_check_interval == 0)))
-        if isect_now and skin_topology is not None:
-            moved = [i for i in active
-                     if vec_length(vec_sub(proposed[i], before_it[i])) > 1e-12]
-            if moved:
-                loc = anatomy_constraint.analyze_skin_anatomy_intersections(
-                    mesh_name, skin_indices=moved, backend=anatomy_backend,
-                    positions=proposed, neighbors=neighbors,
-                    skin_topology=skin_topology,
-                    candidate_growth_rings=1,
-                    boundary_buffer_rings=boundary_buffer_rings,
-                    intersection_tolerance=intersection_tolerance,
-                    detailed=False, verbose=False)
-                if loc.get("intersection_pair_count", 0) > 0:
-                    isect_metrics["new_intersections_detected_during_smoothing"] += 1
-                    irep = anatomy_constraint.resolve_skin_anatomy_intersections(
-                        proposed, moved, anatomy_backend, skin_mesh=mesh_name,
-                        neighbors=neighbors, normals=normals,
-                        skin_topology=skin_topology, min_clearance=min_clearance,
-                        clearance_tolerance=clearance_tolerance,
-                        max_intersection_repair_iterations=min(
-                            5, max_intersection_repair_iterations),
-                        intersection_repair_step_ratio=intersection_repair_step_ratio,
-                        intersection_repair_growth_rings=0,
-                        boundary_buffer_rings=boundary_buffer_rings,
-                        intersection_tolerance=intersection_tolerance,
-                        binary_search_min_step=False, verbose=False,
-                        repair_mode=repair_mode,
-                        repair_blend_rings=min(1, int(repair_blend_rings or 0)),
-                        repair_ring_weights=repair_ring_weights,
-                        repair_binary_search=repair_binary_search,
-                        max_surface_repair_passes=min(
-                            2, int(max_surface_repair_passes or 2)),
-                        max_repair_displacement_ratio=max_repair_displacement_ratio,
-                        post_repair_relax=False,
-                        clearance_policy=clearance_policy)
-                    proposed = irep["positions"]
-                    after_loc = irep.get("report_after") or {}
-                    if after_loc.get("intersection_pair_count", 0) <= 0:
-                        isect_metrics["new_intersections_prevented"] += 1
-                        isect_metrics["unsafe_iterations_repaired"] += 1
-                    else:
-                        core = anatomy_constraint.intersection_vertices_from_report(
-                            after_loc, skin_topology, allowed=set(active))
-                        for i in core:
-                            proposed[i] = list(before_it[i])
-                        still = anatomy_constraint.analyze_skin_anatomy_intersections(
-                            mesh_name, skin_indices=moved, backend=anatomy_backend,
-                            positions=proposed, neighbors=neighbors,
-                            skin_topology=skin_topology,
-                            candidate_growth_rings=1,
-                            boundary_buffer_rings=boundary_buffer_rings,
-                            intersection_tolerance=intersection_tolerance,
-                            detailed=False, verbose=False)
-                        if still.get("intersection_pair_count", 0) > 0:
-                            for i in moved:
-                                proposed[i] = list(before_it[i])
-                        isect_metrics["unsafe_iterations_rejected"] += 1
-                        isect_metrics["new_intersections_prevented"] += 1
+        do_line_search = (
+            step_policy == "largest_safe_fraction"
+            and isect_now and skin_topology is not None
+            and bool(line_search_surface_check)
+            and moved)
 
+        accepted_alpha = 1.0
+        if do_line_search:
+            baseline = _local_intersection_report(
+                mesh_name, before_it, moved, anatomy_backend, neighbors,
+                skin_topology, boundary_buffer_rings, intersection_tolerance)
+            baseline_faces = set(baseline.get("intersecting_skin_faces") or [])
+            baseline_pairs = int(baseline.get("intersection_pair_count", 0) or 0)
+
+            def _is_safe(projected):
+                rep = _local_intersection_report(
+                    mesh_name, projected, moved, anatomy_backend, neighbors,
+                    skin_topology, boundary_buffer_rings,
+                    intersection_tolerance)
+                ok, new_faces = _smoothing_candidate_is_safe(
+                    rep, baseline_faces, baseline_pairs)
+                return ok, {"report": rep, "new_faces": new_faces}
+
+            ls = _find_largest_safe_smoothing_step(
+                before_it, laplacian_full, moved, _is_safe,
+                steps=smoothing_line_search_steps,
+                min_alpha=min_smoothing_alpha,
+                project_fn=_project)
+            isect_metrics["line_search_evaluations"] += ls["evaluations"]
+            accepted_alpha = ls["alpha"]
+            proposed = ls["positions"]
+            if ls["status"] == "full":
+                isect_metrics["full_steps_safe"] += 1
+            else:
+                isect_metrics["full_steps_unsafe"] += 1
+                isect_metrics["new_intersections_detected_during_smoothing"] += 1
+                isect_metrics["new_intersections_prevented"] += 1
+                if ls["status"] == "partial":
+                    isect_metrics["partial_steps_accepted"] += 1
+                    isect_metrics["unsafe_full_steps_recovered_by_line_search"] += 1
+                    pd = [vec_length(vec_sub(proposed[i], before_it[i]))
+                          for i in active]
+                    isect_metrics["partial_step_displacements"].append(
+                        (sum(pd) / len(pd)) if pd else 0.0)
+                else:
+                    isect_metrics["stalled_steps"] += 1
+                    isect_metrics["unsafe_iterations_rejected"] += 1
+                    proposed = [list(p) for p in before_it]
+                    accepted_alpha = 0.0
+            if ls["status"] != "stalled_no_safe_step":
+                _accepted, acc_stats = _apply_iteration_constraints(
+                    before_it, _scale_displacement_field(
+                        before_it, laplacian_full, accepted_alpha, moved),
+                    active, anatomy_backend, sdf_query_fn, floors, min_clearance,
+                    normals, solver, use_exact, do_segment, do_tangent,
+                    constrain_now, max_constraint_iterations, clearance_tolerance)
+                proposed = _accepted
+                segment_detected += acc_stats["segment_detected"]
+                segment_prevented += acc_stats["segment_prevented"]
+                constraint_events += acc_stats["constraint_events"]
+                constrained_vertices |= acc_stats["constrained_vertices"]
+                corrections.extend(acc_stats["corrections"])
+                projection_steps += acc_stats["projection_steps"]
+                if acc_stats["max_proj_used"] > max_proj_used:
+                    max_proj_used = acc_stats["max_proj_used"]
+                unresolved_constraints += acc_stats["unresolved"]
+                normal_removed.extend(acc_stats["normal_removed"])
+                tangent_kept.extend(acc_stats["tangent_kept"])
+        else:
+            proposed, acc_stats = _apply_iteration_constraints(
+                before_it, laplacian_full, active, anatomy_backend,
+                sdf_query_fn, floors, min_clearance, normals, solver,
+                use_exact, do_segment, do_tangent, constrain_now,
+                max_constraint_iterations, clearance_tolerance)
+            segment_detected += acc_stats["segment_detected"]
+            segment_prevented += acc_stats["segment_prevented"]
+            constraint_events += acc_stats["constraint_events"]
+            constrained_vertices |= acc_stats["constrained_vertices"]
+            corrections.extend(acc_stats["corrections"])
+            projection_steps += acc_stats["projection_steps"]
+            if acc_stats["max_proj_used"] > max_proj_used:
+                max_proj_used = acc_stats["max_proj_used"]
+            unresolved_constraints += acc_stats["unresolved"]
+            normal_removed.extend(acc_stats["normal_removed"])
+            tangent_kept.extend(acc_stats["tangent_kept"])
+
+            if (step_policy == "rollback" and isect_now
+                    and skin_topology is not None):
+                moved_r = [i for i in active
+                           if vec_length(vec_sub(proposed[i], before_it[i])) > 1e-12]
+                if moved_r:
+                    loc = _local_intersection_report(
+                        mesh_name, proposed, moved_r, anatomy_backend,
+                        neighbors, skin_topology, boundary_buffer_rings,
+                        intersection_tolerance)
+                    if loc.get("intersection_pair_count", 0) > 0:
+                        isect_metrics["full_steps_unsafe"] += 1
+                        isect_metrics["new_intersections_detected_during_smoothing"] += 1
+                        proposed, outcome = _legacy_repair_or_rollback_intersections(
+                            proposed, before_it, moved_r, active,
+                            anatomy_backend, mesh_name, neighbors, normals,
+                            skin_topology, min_clearance, clearance_tolerance,
+                            max_intersection_repair_iterations,
+                            intersection_repair_step_ratio,
+                            boundary_buffer_rings, intersection_tolerance,
+                            repair_mode, repair_blend_rings,
+                            repair_ring_weights, repair_binary_search,
+                            max_surface_repair_passes,
+                            max_repair_displacement_ratio, clearance_policy)
+                        isect_metrics["new_intersections_prevented"] += 1
+                        if outcome == "repaired":
+                            isect_metrics["unsafe_iterations_repaired"] += 1
+                            accepted_alpha = 1.0
+                        else:
+                            isect_metrics["unsafe_iterations_rejected"] += 1
+                            isect_metrics["stalled_steps"] += 1
+                            accepted_alpha = 0.0
+                    else:
+                        isect_metrics["full_steps_safe"] += 1
+                else:
+                    isect_metrics["full_steps_safe"] += 1
+            else:
+                isect_metrics["full_steps_safe"] += 1
+
+        isect_metrics["accepted_alpha_per_iteration"].append(accepted_alpha)
         work = proposed
 
         if verbose_iterations and (it % max(1, report_interval) == 0):
@@ -665,9 +979,10 @@ def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearan
                               for i in active), default=0.0)
             else:
                 minclr = min((sdf_query_fn(work[i])[0] for i in active), default=0.0)
-            print("  [iter {0:4d}] applied mean disp={1:.5f} constrained so far={2} "
-                  "min clearance={3:.4f}".format(
-                      it, (sum(sd) / len(sd)) if sd else 0.0,
+            print("  [iter {0:4d}] alpha={1:.4f} applied mean disp={2:.5f} "
+                  "constrained so far={3} min clearance={4:.4f}".format(
+                      it, accepted_alpha,
+                      (sum(sd) / len(sd)) if sd else 0.0,
                       len(constrained_vertices), minclr))
 
     final = work
@@ -820,6 +1135,35 @@ def constrained_smooth_mesh_region(mesh_name, indices, sdf_query_fn, min_clearan
         "new_intersections_prevented": isect_metrics["new_intersections_prevented"],
         "unsafe_iterations_repaired": isect_metrics["unsafe_iterations_repaired"],
         "unsafe_iterations_rejected": isect_metrics["unsafe_iterations_rejected"],
+        "unsafe_step_policy": isect_metrics.get("unsafe_step_policy"),
+        "smoothing_line_search_steps": int(smoothing_line_search_steps),
+        "min_smoothing_alpha": float(min_smoothing_alpha),
+        "full_steps_safe": isect_metrics["full_steps_safe"],
+        "full_steps_unsafe": isect_metrics["full_steps_unsafe"],
+        "partial_steps_accepted": isect_metrics["partial_steps_accepted"],
+        "stalled_steps": isect_metrics["stalled_steps"],
+        "line_search_evaluations": isect_metrics["line_search_evaluations"],
+        "accepted_alpha_per_iteration": list(
+            isect_metrics["accepted_alpha_per_iteration"]),
+        "unsafe_full_steps_recovered_by_line_search": isect_metrics[
+            "unsafe_full_steps_recovered_by_line_search"],
+        "full_step_proposed_mean_displacement": (
+            (sum(isect_metrics["full_step_proposed_displacements"])
+             / len(isect_metrics["full_step_proposed_displacements"]))
+            if isect_metrics["full_step_proposed_displacements"] else 0.0),
+        "final_applied_mean_displacement": aps["mean"],
+        "partial_step_total_displacement": sum(
+            isect_metrics["partial_step_displacements"]),
+        "mean_accepted_alpha": (
+            (sum(isect_metrics["accepted_alpha_per_iteration"])
+             / len(isect_metrics["accepted_alpha_per_iteration"]))
+            if isect_metrics["accepted_alpha_per_iteration"] else 0.0),
+        "min_accepted_alpha": (
+            min(isect_metrics["accepted_alpha_per_iteration"])
+            if isect_metrics["accepted_alpha_per_iteration"] else 0.0),
+        "max_accepted_alpha": (
+            max(isect_metrics["accepted_alpha_per_iteration"])
+            if isect_metrics["accepted_alpha_per_iteration"] else 0.0),
         "intersecting_skin_face_count_after": final_isect.get(
             "intersecting_skin_face_count", 0),
         "intersecting_skin_vertex_count_after": final_isect.get(
@@ -918,6 +1262,23 @@ def _print_constrained_report(m):
               m.get("new_intersections_prevented", 0),
               m.get("unsafe_iterations_repaired", 0),
               m.get("unsafe_iterations_rejected", 0)))
+    print("  SAFE STEP: policy={0}  full_safe={1} full_unsafe={2}  "
+          "partial_accepted={3} stalled={4}  recovered_by_line_search={5}".format(
+              m.get("unsafe_step_policy"),
+              m.get("full_steps_safe", 0), m.get("full_steps_unsafe", 0),
+              m.get("partial_steps_accepted", 0), m.get("stalled_steps", 0),
+              m.get("unsafe_full_steps_recovered_by_line_search", 0)))
+    print("  accepted alpha: mean={0:.4f} min={1:.4f} max={2:.4f}  "
+          "line_search_evals={3}  per_iter={4}".format(
+              m.get("mean_accepted_alpha", 0.0),
+              m.get("min_accepted_alpha", 0.0),
+              m.get("max_accepted_alpha", 0.0),
+              m.get("line_search_evaluations", 0),
+              m.get("accepted_alpha_per_iteration") or []))
+    print("  per-iter full-step proposed mean={0:.5f}  "
+          "partial-step total disp={1:.5f}".format(
+              m.get("full_step_proposed_mean_displacement", 0.0),
+              m.get("partial_step_total_displacement", 0.0)))
     print("  intersection pre-repair: iters={0} moved={1} resolved_faces={2} "
           "unresolved={3} mean_disp={4:.5f}".format(
               m.get("intersection_repair_iterations", 0),

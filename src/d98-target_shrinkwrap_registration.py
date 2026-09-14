@@ -3197,7 +3197,10 @@ def constrained_smooth_m5_region(indices, method="laplacian", strength=0.2,
                                  repair_binary_search=True,
                                  max_surface_repair_passes=5,
                                  max_repair_displacement_ratio=1.0,
-                                 post_repair_relax=False):
+                                 post_repair_relax=False,
+                                 unsafe_step_policy="largest_safe_fraction",
+                                 smoothing_line_search_steps=8,
+                                 min_smoothing_alpha=1e-3):
     """ANATOMY-CONSTRAINED smoothing of an M5 region (keeps skin above anatomy).
 
     Additive counterpart to :func:`smooth_m5_region`. Default solver is the
@@ -3208,7 +3211,11 @@ def constrained_smooth_m5_region(indices, method="laplacian", strength=0.2,
     prevent_segment_crossing=False, prevent_surface_intersections=False,
     preserve_tangential=False, clearance_policy="global"`` to reproduce the
     historical one-shot smooth-min push. ``smooth_m5_region`` is unchanged.
-    Pre-repair + smoothing share ONE Maya undo chunk. One optional backup.
+    Default ``unsafe_step_policy="largest_safe_fraction"`` accepts the largest
+    safe fraction of an unsafe Laplacian step instead of rejecting the
+    iteration. Pass ``unsafe_step_policy="rollback"`` to reproduce the
+    historical all-or-nothing reject. Pre-repair + smoothing share ONE Maya
+    undo chunk. One optional backup.
     """
     if not _helpers_ready():
         return
@@ -3272,7 +3279,10 @@ def constrained_smooth_m5_region(indices, method="laplacian", strength=0.2,
             repair_binary_search=repair_binary_search,
             max_surface_repair_passes=max_surface_repair_passes,
             max_repair_displacement_ratio=max_repair_displacement_ratio,
-            post_repair_relax=post_repair_relax)
+            post_repair_relax=post_repair_relax,
+            unsafe_step_policy=unsafe_step_policy,
+            smoothing_line_search_steps=smoothing_line_search_steps,
+            min_smoothing_alpha=min_smoothing_alpha)
     finally:
         if opened:
             try:
