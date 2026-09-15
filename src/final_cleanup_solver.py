@@ -43,7 +43,30 @@ What IS new here (the actual gap this module fills):
   instead of "reject the whole batch if anything is unsafe";
 * multi-signal convergence with patience, so ``max_iterations`` is a safety cap,
   not the definition of "done" -- running longer than necessary should reach the
-  same fixed point, not keep shrinking the face.
+  same fixed point, not keep shrinking the face;
+* a PHASE 0 (:func:`_run_initial_feasibility`) that repairs every pre-existing
+  surface intersection and captures the resulting anatomy-VALID mesh as the
+  rest/positional reference BEFORE any fairing/M4/shape force is computed.
+  Earlier versions of this module captured the rest reference from the raw,
+  unrepaired registered mesh; since that mesh could itself be anatomically
+  invalid wherever M5/the intersection scan had flagged a problem, the
+  shape-restraint force was pulling freshly-repaired geometry straight back
+  toward the position that had just been repaired away -- a fair -> repair ->
+  fair -> repair cycle that never converges to a FAIR surface, only to a
+  perpetually-defended one. Phase 0 is what makes "rest position" and "valid
+  position" the same thing for every vertex the solver touches;
+* region-dependent shape restraint (:func:`shape_weight_from_anchor`), M4
+  force decay once its improvement plateaus (:func:`decay_m4_weight`), and
+  oscillation detection (:func:`update_oscillation_tracker`) that damps a
+  vertex's forces once it is repeatedly repaired, instead of letting it fight
+  the same battle for hundreds of iterations;
+* roughness is now a real ACCEPTANCE/convergence target (bounded by a ceiling
+  derived from the mesh's own original roughness), not just a number that gets
+  logged while the loop happily continues regardless of what it does;
+* every accepted iteration validates and absorbs the FULL footprint the broad
+  repair actually touched (which can extend past the pre-repair active set via
+  its own ``repair_blend_rings`` growth), not just the vertices the solver
+  already considered active.
 
 Historical milestones (M1-M5), the legacy V1/V2 repair modes, and the
 strict / repair_after_batch / off smoothing safety modes in
@@ -112,6 +135,34 @@ DEFAULT_MEAN_DISPLACEMENT_TOLERANCE = 1e-4
 DEFAULT_MAX_DISPLACEMENT_TOLERANCE = 5e-4
 DEFAULT_ROUGHNESS_REL_IMPROVEMENT_TOLERANCE = 0.01
 DEFAULT_M4_REL_IMPROVEMENT_TOLERANCE = 0.01
+
+# --- Phase 0 (initial feasibility) ------------------------------------------
+DEFAULT_MAX_FEASIBILITY_PASSES = 5
+
+# --- region-dependent shape restraint ----------------------------------------
+# Shape restraint is WEAKEST at the artifact core (most freedom to fair local
+# defects, including ones introduced by Phase 0's own repair) and ramps up to
+# full strength across the transition band (holding facial identity near the
+# fixed exterior), using the SAME anchor value build_active_region already
+# computes -- no separate region bookkeeping needed.
+DEFAULT_CORE_SHAPE_SCALE = 0.3
+
+# --- M4 force decay ------------------------------------------------------
+# M4 is guidance, not a final target: once its relative improvement plateaus
+# (the SAME patience signal used for convergence), decay w_m4 geometrically
+# rather than pulling at full strength forever.
+DEFAULT_M4_DECAY_PATIENCE = 2
+DEFAULT_M4_DECAY_RATE = 0.7
+DEFAULT_M4_MIN_WEIGHT_FRACTION = 0.0
+
+# --- roughness as a real acceptance/convergence target ------------------------
+DEFAULT_MAX_ROUGHNESS_RATIO = 1.5   # vs. the ORIGINAL pre-cleanup roughness
+DEFAULT_REPAIR_DISPLACEMENT_TOLERANCE = 1e-3
+
+# --- oscillation (fair -> repair -> fair -> repair ping-pong) detection -------
+DEFAULT_OSCILLATION_WINDOW = 5
+DEFAULT_OSCILLATION_REPEAT_THRESHOLD = 3
+DEFAULT_OSCILLATION_DAMPING = 0.2
 
 STOP_MAX_ITERATIONS = "max_iterations"
 STOP_CONVERGED = "convergence_tolerance"
@@ -295,10 +346,25 @@ def fairing_force(positions: List[List[float]],
     return out
 
 
+def shape_weight_from_anchor(anchor_i: float, core_shape_scale: float) -> float:
+    """Region-dependent shape-restraint multiplier from a transition anchor.
+
+    ``core_shape_scale`` at ``anchor_i == 0`` (artifact core / fairing region,
+    where local defects -- including Phase 0's own repair bumps -- need the
+    MOST freedom to fair), ramping linearly to ``1.0`` at ``anchor_i == 1``
+    (outer transition edge, where facial identity should be held firmly).
+    Uses the SAME anchor value :func:`build_active_region` already computes;
+    no separate region bookkeeping is needed.
+    """
+    a = min(1.0, max(0.0, float(anchor_i)))
+    scale = min(1.0, max(0.0, float(core_shape_scale)))
+    return scale + (1.0 - scale) * a
+
+
 def shape_force(positions: List[List[float]],
                 rest_positions: List[List[float]],
                 indices: Sequence[int],
-                w_shape: float,
+                w_shape,
                 ) -> Dict[int, List[float]]:
     """Restoring pull toward the registered ("rest") position.
 
@@ -306,15 +372,71 @@ def shape_force(positions: List[List[float]],
     converging toward a fully flattened harmonic surface: the operator's fixed
     point is now a compromise between "locally smooth" and "close to the
     original registered shape", not smoothness alone.
+
+    ``w_shape`` may be a single float (applied to every index) or a
+    ``{i: weight}`` dict (region-dependent restraint via
+    :func:`shape_weight_from_anchor`).
+
+    IMPORTANT: ``rest_positions`` must be an anatomy-FEASIBLE reference (the
+    Phase-0-repaired skin), never the raw pre-repair registered mesh -- pulling
+    toward a position that itself violates anatomy is exactly what turns
+    intersection repair into a fight the repair can never win (see the module
+    docstring's Phase 0 section).
     """
+    per_vertex = w_shape if isinstance(w_shape, dict) else None
     out: Dict[int, List[float]] = {}
     for i in indices:
-        if w_shape == 0.0:
+        w = per_vertex.get(i, 0.0) if per_vertex is not None else w_shape
+        if w == 0.0:
             out[i] = [0.0, 0.0, 0.0]
             continue
         out[i] = mesh_utils.vec_scale(
-            mesh_utils.vec_sub(rest_positions[i], positions[i]), w_shape)
+            mesh_utils.vec_sub(rest_positions[i], positions[i]), w)
     return out
+
+
+def decay_m4_weight(w_m4: float,
+                    plateau_streak: int,
+                    decay_patience: int,
+                    decay_rate: float,
+                    min_fraction: float = DEFAULT_M4_MIN_WEIGHT_FRACTION,
+                    ) -> float:
+    """Geometric M4-weight decay once M4 improvement has plateaued.
+
+    M4 is a directional/reference signal, not a final target (see the module
+    docstring): full strength while it is still doing useful work
+    (``plateau_streak < decay_patience``), then decays by ``decay_rate`` per
+    additional plateaued iteration, floored at ``w_m4 * min_fraction`` so it
+    never overshoots into negative/oscillating territory.
+    """
+    over = int(plateau_streak) - int(decay_patience) + 1
+    if over <= 0:
+        return float(w_m4)
+    factor = max(float(min_fraction), float(decay_rate) ** over)
+    return float(w_m4) * factor
+
+
+def update_oscillation_tracker(history: List[Set[int]],
+                               repaired_now: Sequence[int],
+                               window: int,
+                               threshold: int,
+                               ) -> Tuple[List[Set[int]], Set[int]]:
+    """Track a rolling window of per-iteration repaired-vertex sets and flag
+    vertices repaired in ``>= threshold`` of the last ``window`` iterations
+    (a fair -> repair -> fair -> repair ping-pong signature).
+
+    Returns ``(updated_history, oscillating_vertices)``. Pure / no Maya access
+    -- unit-tested directly with synthetic repair histories.
+    """
+    hist = list(history) + [set(repaired_now)]
+    if len(hist) > max(1, int(window)):
+        hist = hist[-int(window):]
+    counts: Dict[int, int] = {}
+    for s in hist:
+        for v in s:
+            counts[v] = counts.get(v, 0) + 1
+    oscillating = {v for v, c in counts.items() if c >= int(threshold)}
+    return hist, oscillating
 
 
 def m4_force(positions: List[List[float]],
@@ -560,22 +682,193 @@ def _repair_local(positions: List[List[float]],
     return result["positions"], result
 
 
-def _compute_m4_targets(skin_mesh: str,
-                        anatomical_meshes: Sequence[str],
-                        target_offset: float,
+# =============================================================================
+# 2b. PHASE 0 -- INITIAL FEASIBILITY
+#    Establishes an anatomy-VALID starting point BEFORE the iterative fairing
+#    loop, and before the "rest"/positional reference is captured. This is
+#    NOT an ordinary fairing iteration: it exists specifically so the solver
+#    never asks the rest-shape restraint to pull repaired geometry back toward
+#    a position that was itself anatomically invalid (see the module
+#    docstring). The broad anatomy-supported patch repair (unchanged) already
+#    includes its own bounded local relax pass (``post_repair_relax``); Phase
+#    0 just gives that machinery room to work BEFORE fairing forces start
+#    layering on top of it.
+# =============================================================================
+
+def _run_initial_feasibility(positions: List[List[float]],
+                             skin_mesh: str,
+                             backend: Any,
+                             neighbors: List[List[int]],
+                             normals: Optional[List[List[float]]],
+                             skin_topology: Dict[str, Any],
+                             min_clearance: float,
+                             clearance_policy: str,
+                             boundary_buffer_rings: int,
+                             intersection_tolerance: float,
+                             repair_kwargs: Dict[str, Any],
+                             max_passes: int,
+                             verbose: bool,
+                             ) -> Dict[str, Any]:
+    """Repair every PRE-EXISTING real surface intersection (whole mesh) before
+    any fairing/M4/shape force is ever computed.
+
+    Bounded by ``max_passes``: each pass repairs whatever the CURRENT
+    intersecting core is (the broad repair's own patch/component machinery is
+    reused as-is), then re-scans the WHOLE mesh. Stops early once clean.
+    Non-convergence after ``max_passes`` is reported, not silently hidden --
+    the outer iterative loop's own per-iteration repair will keep trying on
+    whatever remains, but Phase 0 is where the bulk of the pre-existing
+    workload should be absorbed.
+
+    Returns
+    -------
+    dict
+        ``{"positions", "touched_vertices", "pre_intersections", "post_intersections",
+           "passes", "resolved", "displacement", "roughness_before", "roughness_after"}``.
+    """
+    work = [list(p) for p in positions]
+    n = len(work)
+    all_indices = list(range(n))
+
+    pre_report = anatomy_constraint.analyze_skin_anatomy_intersections(
+        skin_mesh, skin_indices=all_indices, backend=backend, positions=work,
+        neighbors=neighbors, skin_topology=skin_topology,
+        boundary_buffer_rings=boundary_buffer_rings,
+        intersection_tolerance=intersection_tolerance, detailed=False, verbose=False)
+    pre_core = anatomy_constraint.intersection_vertices_from_report(pre_report, skin_topology)
+    roughness_before = mean_laplacian_magnitude(work, neighbors, pre_core) if pre_core else 0.0
+
+    touched: Set[int] = set()
+    last_report = pre_report
+    passes = 0
+    for p in range(1, max(1, int(max_passes)) + 1):
+        passes = p
+        core_now = anatomy_constraint.intersection_vertices_from_report(last_report, skin_topology)
+        if not core_now:
+            break
+        result = anatomy_constraint.resolve_skin_anatomy_intersections(
+            work, core_now, backend, skin_mesh=skin_mesh, neighbors=neighbors,
+            normals=normals, skin_topology=skin_topology,
+            min_clearance=min_clearance, clearance_policy=clearance_policy,
+            boundary_buffer_rings=boundary_buffer_rings,
+            intersection_tolerance=intersection_tolerance, verbose=False,
+            **repair_kwargs)
+        work = result["positions"]
+        touched |= set(result.get("patch_vertices") or core_now)
+        last_report = anatomy_constraint.analyze_skin_anatomy_intersections(
+            skin_mesh, skin_indices=all_indices, backend=backend, positions=work,
+            neighbors=neighbors, skin_topology=skin_topology,
+            boundary_buffer_rings=boundary_buffer_rings,
+            intersection_tolerance=intersection_tolerance, detailed=False, verbose=False)
+        if verbose:
+            print("  [feasibility pass {0}] faces {1} -> {2}".format(
+                p, pre_report.get("intersecting_skin_face_count", 0) if p == 1 else "...",
+                last_report.get("intersecting_skin_face_count", 0)))
+        if last_report.get("intersection_pair_count", 0) <= 0:
+            break
+
+    resolved = last_report.get("intersection_pair_count", 0) <= 0
+    disp = [mesh_utils.vec_length(mesh_utils.vec_sub(work[i], positions[i])) for i in touched]
+    roughness_after = mean_laplacian_magnitude(work, neighbors, sorted(touched)) if touched else 0.0
+
+    return {
+        "positions": work,
+        "touched_vertices": sorted(touched),
+        "pre_intersections": {"face_count": pre_report.get("intersecting_skin_face_count", 0),
+                             "pair_count": pre_report.get("intersection_pair_count", 0)},
+        "post_intersections": {"face_count": last_report.get("intersecting_skin_face_count", 0),
+                              "pair_count": last_report.get("intersection_pair_count", 0)},
+        "passes": passes,
+        "resolved": bool(resolved),
+        "displacement": _stats(disp),
+        "roughness_before": roughness_before,
+        "roughness_after": roughness_after,
+    }
+
+
+def _absorb_vertices(new_vertices: Sequence[int],
+                     fairing_region: Set[int],
+                     boundary: Set[int],
+                     neighbors: List[List[int]],
+                     transition_rings: int,
+                     provenance: Dict[int, str],
+                     weights: Dict[int, Tuple[float, float]],
+                     floors: Dict[int, float],
+                     positions: List[List[float]],
+                     anatomy_backend: Any,
+                     min_clearance: float,
+                     clearance_policy: str,
+                     clearance_tolerance: float,
+                     w_fair: float,
+                     tag: str,
+                     ) -> Tuple[Set[int], Set[int], Dict[str, float]]:
+    """Fold newly-discovered vertices (dynamic growth, redetection, or a
+    repair patch that grew past the current active set) into the active
+    region, with the same bookkeeping every growth path needs: rebuild
+    fairing/transition/anchor, tag provenance, assign a default (fairing-only)
+    weight, and compute their clearance floor. Shared so this bookkeeping is
+    written once instead of three times.
+
+    Returns ``(new_fairing_region, new_active, new_anchor)``.
+    """
+    new_vertices = sorted(set(new_vertices) - boundary)
+    if not new_vertices:
+        region = build_active_region(sorted(fairing_region), neighbors, boundary,
+                                     0, transition_rings)
+        return fairing_region, set(region["active"]), region["anchor"]
+    fairing_region = set(fairing_region) | set(new_vertices)
+    region = build_active_region(sorted(fairing_region), neighbors, boundary,
+                                 0, transition_rings)
+    active = set(region["active"])
+    for j in new_vertices:
+        provenance.setdefault(j, tag)
+        weights.setdefault(j, (w_fair, 0.0))
+    unfloored = sorted(active - set(floors.keys()))
+    if unfloored:
+        new_floors, _od, _pu = anatomy_constraint.compute_clearance_floors(
+            positions, unfloored, anatomy_backend, min_clearance,
+            clearance_policy=clearance_policy, clearance_tolerance=clearance_tolerance)
+        floors.update(new_floors)
+    for j in active - set(weights.keys()):
+        provenance.setdefault(j, tag)
+        weights.setdefault(j, (w_fair * 0.5, 0.0))
+    return fairing_region, active, region["anchor"]
+
+
+def _compute_m4_targets(positions: List[List[float]],
                         indices: Sequence[int],
-                        sdf_query: Optional[Any] = None,
+                        sdf_query: Any,
+                        target_offset: float,
+                        max_projection_distance: Optional[float] = None,
                         ) -> Dict[int, List[float]]:
     """Static anatomy-derived correction targets for ``indices`` (computed
-    ONCE; anatomy does not move during cleanup). Reuses M4's own projector."""
-    if not indices:
+    ONCE; anatomy does not move during cleanup). Reuses M4's own per-point
+    projector (:func:`artifact_detection.project_point_to_iso_surface`)
+    directly against the in-memory ``positions`` array.
+
+    Deliberately does NOT call :func:`artifact_detection.compute_sdf_target_positions`
+    (the mesh-level M4 wrapper): that function reads its OWN copy of the
+    vertex positions straight from the live Maya mesh, which would either (a)
+    use the pre-Phase-0 (still anatomy-invalid) positions as the Newton
+    search's starting point, or (b) require writing ``positions`` to the scene
+    first to get the right starting point -- which would corrupt ``apply=False``
+    dry runs by leaving the scene modified. Calling the per-point primitive
+    directly avoids both problems while reusing the exact same projection math.
+    """
+    if not indices or sdf_query is None:
         return {}
-    data = artifact_detection.compute_sdf_target_positions(
-        skin_mesh, anatomical_meshes, target_offset, indices=sorted(indices),
-        sdf_query=sdf_query)
-    positions = data.get("target_positions") or {}
-    converged = set(data.get("converged_indices") or [])
-    return {i: positions[i] for i in converged if i in positions}
+    targets: Dict[int, List[float]] = {}
+    for i in indices:
+        t_i, conv = artifact_detection.project_point_to_iso_surface(
+            positions[i], sdf_query, target_offset,
+            max_step=max_projection_distance)
+        if not conv.get("converged"):
+            continue
+        if (max_projection_distance is not None
+                and conv.get("total_displacement", 0.0) > max_projection_distance):
+            continue
+        targets[i] = t_i
+    return targets
 
 
 # =============================================================================
@@ -606,18 +899,19 @@ def _write_json(report: Dict[str, Any], path: str) -> Optional[str]:
 
 
 _CSV_COLUMNS = [
-    "iteration", "active_count",
+    "iteration", "active_count", "w_m4_effective",
     "fair_disp_mean", "fair_disp_max",
     "m4_disp_mean", "m4_disp_max",
     "shape_disp_mean", "shape_disp_max",
     "clearance_disp_mean", "clearance_disp_max",
     "repair_disp_mean", "repair_disp_max",
     "net_disp_mean", "net_disp_max",
-    "roughness_before", "roughness_after",
+    "roughness_before", "roughness_after", "roughness_ceiling",
     "m4_disagreement_before", "m4_disagreement_after",
-    "intersecting_face_count", "intersection_pair_count", "repaired_component_count",
-    "min_exact_distance", "no_forbidden_intersections",
+    "proposal_face_count", "intersection_pair_count", "repaired_component_count",
+    "min_exact_distance", "no_forbidden_intersections", "oscillating_count",
     "patience_motion", "patience_roughness", "patience_m4",
+    "patience_proposal_clean", "patience_repair",
 ]
 
 
@@ -638,7 +932,8 @@ def _write_csv(rows: List[Dict[str, Any]], path: str) -> Optional[str]:
 
 
 def _iteration_csv_row(rec: Dict[str, Any]) -> Dict[str, Any]:
-    row = {"iteration": rec["iteration"], "active_count": rec["active_count"]}
+    row = {"iteration": rec["iteration"], "active_count": rec["active_count"],
+          "w_m4_effective": round(rec.get("w_m4_effective", 0.0), 6)}
     for prefix, key in (("fair", "fairing_displacement"), ("m4", "m4_displacement"),
                         ("shape", "shape_displacement"), ("clearance", "clearance_displacement"),
                         ("repair", "repair_displacement"), ("net", "net_displacement")):
@@ -646,16 +941,20 @@ def _iteration_csv_row(rec: Dict[str, Any]) -> Dict[str, Any]:
         row[prefix + "_disp_max"] = round(rec[key]["max"], 8)
     row["roughness_before"] = round(rec["roughness"]["before"], 8)
     row["roughness_after"] = round(rec["roughness"]["after"], 8)
+    row["roughness_ceiling"] = round(rec.get("roughness_ceiling", 0.0), 8)
     row["m4_disagreement_before"] = round(rec["m4_disagreement"]["before"], 8)
     row["m4_disagreement_after"] = round(rec["m4_disagreement"]["after"], 8)
-    row["intersecting_face_count"] = rec["intersections"]["face_count"]
+    row["proposal_face_count"] = rec["intersections"]["face_count"]
     row["intersection_pair_count"] = rec["intersections"]["pair_count"]
     row["repaired_component_count"] = rec["intersections"]["repaired_component_count"]
     row["min_exact_distance"] = round(rec["min_exact_distance"], 6)
     row["no_forbidden_intersections"] = rec["no_forbidden_intersections"]
+    row["oscillating_count"] = rec.get("oscillating_count", 0)
     row["patience_motion"] = rec["patience"]["motion"]
     row["patience_roughness"] = rec["patience"]["roughness"]
     row["patience_m4"] = rec["patience"]["m4"]
+    row["patience_proposal_clean"] = rec["patience"].get("proposal_clean", 0)
+    row["patience_repair"] = rec["patience"].get("repair", 0)
     return row
 
 
@@ -690,6 +989,22 @@ def run_cleanup_solver(skin_mesh: str,
                        intersection_tolerance: float = DEFAULT_INTERSECTION_TOLERANCE,
                        repair_profile: str = DEFAULT_REPAIR_PROFILE,
                        repair_kwargs: Optional[Dict[str, Any]] = None,
+                       # --- Phase 0: initial feasibility ----------------------
+                       run_initial_feasibility: bool = True,
+                       max_feasibility_passes: int = DEFAULT_MAX_FEASIBILITY_PASSES,
+                       # --- region-dependent shape restraint -------------------
+                       core_shape_scale: float = DEFAULT_CORE_SHAPE_SCALE,
+                       # --- M4 force decay --------------------------------------
+                       m4_decay_patience: int = DEFAULT_M4_DECAY_PATIENCE,
+                       m4_decay_rate: float = DEFAULT_M4_DECAY_RATE,
+                       m4_min_weight_fraction: float = DEFAULT_M4_MIN_WEIGHT_FRACTION,
+                       # --- roughness as an acceptance target ------------------
+                       max_roughness_ratio: float = DEFAULT_MAX_ROUGHNESS_RATIO,
+                       repair_displacement_tolerance: float = DEFAULT_REPAIR_DISPLACEMENT_TOLERANCE,
+                       # --- oscillation detection -------------------------------
+                       oscillation_window: int = DEFAULT_OSCILLATION_WINDOW,
+                       oscillation_repeat_threshold: int = DEFAULT_OSCILLATION_REPEAT_THRESHOLD,
+                       oscillation_damping: float = DEFAULT_OSCILLATION_DAMPING,
                        # --- dynamic active set --------------------------------
                        dynamic_active_set: bool = True,
                        dynamic_growth_zscore: float = DEFAULT_DYNAMIC_GROWTH_ZSCORE,
@@ -765,9 +1080,42 @@ def run_cleanup_solver(skin_mesh: str,
         If set (and ``apply=True``), re-run M5 every N iterations and union any
         newly detected vertices into the active region. Ignored when
         ``apply=False`` (M5 needs to read the live mesh).
+    run_initial_feasibility, max_feasibility_passes:
+        Phase 0 (see the module docstring): repair every pre-existing surface
+        intersection and use the result as the rest/positional reference,
+        before any iteration runs. Disabling this reproduces the earlier
+        (buggy) behaviour of pulling toward the raw, possibly-invalid,
+        registered mesh -- keep it on unless you are specifically A/B testing
+        Phase 0 itself.
+    core_shape_scale:
+        Shape-restraint multiplier at the artifact core (``1.0`` at the outer
+        transition edge); lower values give local defects more freedom to fair
+        instead of being pulled back toward their (possibly still slightly
+        rough) Phase-0-repaired position.
+    m4_decay_patience, m4_decay_rate, m4_min_weight_fraction:
+        M4 is guidance, not a final target: once its relative improvement has
+        plateaued for ``m4_decay_patience`` iterations, ``w_m4`` decays
+        geometrically by ``m4_decay_rate`` per further plateaued iteration,
+        floored at ``w_m4 * m4_min_weight_fraction``.
+    max_roughness_ratio:
+        Convergence additionally requires final roughness to be at or below
+        ``max_roughness_ratio`` times the ORIGINAL (pre-cleanup) roughness --
+        "anatomically safe" is necessary but not sufficient for convergence.
+    oscillation_window, oscillation_repeat_threshold, oscillation_damping:
+        A vertex needing repair in ``oscillation_repeat_threshold`` of the last
+        ``oscillation_window`` iterations is a fair<->repair ping-pong; its
+        fairing/M4 weights are damped by ``oscillation_damping`` (once) so it
+        holds its last safe position while the rest of the region keeps
+        converging, instead of fighting to ``max_iterations``.
     max_iterations, convergence_patience, *_tolerance:
         Hard cap and the multi-signal convergence gate (see the module
         docstring). ``max_iterations`` is a safety cap, not the target.
+        Convergence now requires ALL of: no forbidden intersections, the final
+        proposal being clean (no NEW intersections to repair), repair
+        displacement near zero, net displacement near zero, roughness
+        relative-improvement near zero AND under the roughness ceiling, and M4
+        relative-improvement near zero -- each sustained for
+        ``convergence_patience`` consecutive iterations.
 
     Returns
     -------
@@ -851,13 +1199,56 @@ def run_cleanup_solver(skin_mesh: str,
         elif verbose:
             print("[final_cleanup] backup '{0}' already exists; keeping it".format(backup_name))
 
+    repair_kw = dict(repair_kwargs or {})
+    repair_kw.setdefault("repair_profile", repair_profile)
+
     # --- one whole-mesh intersection scan seeds the core with any PRE-EXISTING
     #     surface intersections M5's score-based detectors would not flag ------
     isect0_core, isect0_report = _scoped_intersection_core(
         skin_mesh, positions0, list(range(len(positions0))), anatomy_backend,
         neighbors, skin_topology, boundary_buffer_rings, intersection_tolerance)
 
-    core0 = sorted((set(m5_indices) | set(isect0_core)) - boundary)
+    # --- PHASE 0: initial feasibility -----------------------------------------
+    # Repair every PRE-EXISTING real intersection BEFORE the rest/positional
+    # reference is captured and before any fairing/M4 force is computed. This
+    # is what stops the iterative loop from ever asking the shape-restraint
+    # force to pull repaired geometry back toward a position that was itself
+    # anatomically invalid (see the module docstring). NOT counted as an
+    # ordinary fairing iteration; reported separately.
+    if run_initial_feasibility and isect0_core:
+        if verbose:
+            print("[final_cleanup] --- Phase 0: initial feasibility "
+                  "({0} pre-existing intersecting face(s)) ---".format(
+                      isect0_report.get("intersecting_skin_face_count", 0)))
+        feasibility = _run_initial_feasibility(
+            positions0, skin_mesh, anatomy_backend, neighbors, normals,
+            skin_topology, min_clearance, clearance_policy, boundary_buffer_rings,
+            intersection_tolerance, repair_kw, max_feasibility_passes, verbose)
+        feasible_positions = feasibility["positions"]
+        phase0_touched = set(feasibility["touched_vertices"])
+        if verbose:
+            print("[final_cleanup] Phase 0: {0} pass(es), resolved={1}, "
+                  "faces {2}->{3}, touched={4}, disp mean/max={5:.4f}/{6:.4f}".format(
+                      feasibility["passes"], feasibility["resolved"],
+                      feasibility["pre_intersections"]["face_count"],
+                      feasibility["post_intersections"]["face_count"],
+                      len(phase0_touched), feasibility["displacement"]["mean"],
+                      feasibility["displacement"]["max"]))
+    else:
+        feasible_positions = [list(p) for p in positions0]
+        phase0_touched = set()
+        feasibility = {
+            "positions": feasible_positions, "touched_vertices": [],
+            "pre_intersections": {"face_count": isect0_report.get("intersecting_skin_face_count", 0),
+                                 "pair_count": isect0_report.get("intersection_pair_count", 0)},
+            "post_intersections": {"face_count": isect0_report.get("intersecting_skin_face_count", 0),
+                                  "pair_count": isect0_report.get("intersection_pair_count", 0)},
+            "passes": 0, "resolved": not bool(isect0_core),
+            "displacement": {"count": 0, "mean": 0.0, "max": 0.0},
+            "roughness_before": 0.0, "roughness_after": 0.0,
+        }
+
+    core0 = sorted((set(m5_indices) | set(isect0_core) | phase0_touched) - boundary)
     if not core0:
         if verbose:
             print("[final_cleanup] no artifact / intersection region detected; nothing to do")
@@ -874,62 +1265,74 @@ def run_cleanup_solver(skin_mesh: str,
     active: Set[int] = set(region["active"])
     anchor: Dict[int, float] = region["anchor"]
     provenance = classify_provenance(sorted(active), m3_only0, m4_only0, overlap0)
-    weights = provenance_weights(sorted(active), provenance, w_fair, w_m4,
-                                 m4_only_fair_scale, overlap_m4_scale)
+    weights: Dict[int, Tuple[float, float]] = provenance_weights(
+        sorted(active), provenance, w_fair, w_m4, m4_only_fair_scale, overlap_m4_scale)
 
-    # --- static M4 targets (anatomy does not move; computed once) ------------
+    # --- static M4 targets (anatomy does not move; computed once, against the
+    #     FEASIBLE starting positions so the Newton search begins from valid
+    #     geometry) --------------------------------------------------------
     if sdf_query is None:
         resolved = artifact_detection.resolve_anatomical_meshes(valid_anatomical_meshes)
         sdf_query = (artifact_detection.build_anatomy_sdf_query(resolved["valid"])
                     if resolved["valid"] else None)
     m4_needed = sorted(i for i in active if weights[i][1] > 0.0)
-    m4_targets: Dict[int, List[float]] = (
-        _compute_m4_targets(skin_mesh, valid_anatomical_meshes, target_offset,
-                           m4_needed, sdf_query=sdf_query) if m4_needed else {})
+    m4_targets: Dict[int, List[float]] = _compute_m4_targets(
+        feasible_positions, m4_needed, sdf_query, target_offset)
 
-    # --- baseline-aware clearance floors --------------------------------------
+    # --- baseline-aware clearance floors, computed against the FEASIBLE state -
     floors, _orig_dist, policy_used = anatomy_constraint.compute_clearance_floors(
-        positions0, sorted(active), anatomy_backend, min_clearance,
+        feasible_positions, sorted(active), anatomy_backend, min_clearance,
         clearance_policy=clearance_policy, clearance_tolerance=clearance_tolerance)
 
-    # --- dynamic-growth roughness threshold (one-time, whole-mesh) -----------
+    # --- dynamic-growth roughness threshold (one-time, whole-mesh reference) -
     roughness_threshold = float("inf")
     if dynamic_active_set:
         whole_scores = artifact_detection.compute_laplacian_scores(skin_mesh)
         whole_stats = artifact_detection.summarize_scores(whole_scores)
         roughness_threshold = whole_stats["mean"] + dynamic_growth_zscore * whole_stats["std"]
 
-    x_rest = [list(p) for p in positions0]     # registered-shape reference (fixed for the run)
-    x = [list(p) for p in positions0]          # current accepted state (in-memory working copy)
+    # --- THE REST/POSITIONAL REFERENCE IS THE FEASIBLE STATE, NOT THE RAW
+    #     ORIGINAL REGISTERED MESH. Pulling shape-restraint toward positions
+    #     that were themselves anatomically invalid is what turned repair into
+    #     a fight it could never win (root cause; see the module docstring).
+    x_rest = [list(p) for p in feasible_positions]
+    x = [list(p) for p in feasible_positions]   # current accepted state (in-memory working copy)
 
-    roughness0 = mean_laplacian_magnitude(x, neighbors, sorted(fairing_region))
+    # Roughness measured on the ORIGINAL registered skin (before Phase 0 too)
+    # -- this is the honest "did we end up smoother than we started" baseline
+    # and defines the roughness ceiling below, never something the iterative
+    # loop is allowed to silently exceed forever.
+    roughness_original = mean_laplacian_magnitude(positions0, neighbors, sorted(fairing_region))
+    roughness_ceiling = roughness_original * max_roughness_ratio
+    roughness0 = mean_laplacian_magnitude(x, neighbors, sorted(fairing_region))  # post-Phase-0 start
     m4_disagreement0 = mean_target_disagreement(x, m4_targets, sorted(m4_targets.keys()))
     min_dist0 = min((anatomy_backend.exact_closest(x[i])["distance"] for i in sorted(active)),
                     default=float("inf"))
 
-    repair_kw = dict(repair_kwargs or {})
-    repair_kw.setdefault("repair_profile", repair_profile)
-
     iterations_log: List[Dict[str, Any]] = []
     csv_rows: List[Dict[str, Any]] = []
-    patience = {"motion": 0, "roughness": 0, "m4": 0}
+    patience = {"motion": 0, "roughness": 0, "m4": 0, "proposal_clean": 0, "repair": 0}
     prev_roughness = roughness0
     prev_m4_disagreement = m4_disagreement0
     stop_reason: Optional[str] = None
     converged = False
     total_active_growth = 0
     max_growth_budget = int(math.ceil(max_active_growth_fraction * len(core0)))
+    repair_history: List[Set[int]] = []
+    damped_oscillating: Set[int] = set()
     it = 0
 
     if verbose:
         print("[final_cleanup] core={0} fairing={1} transition={2} active={3} "
-              "(provenance: m3_only={4} m4_only={5} overlap={6} grown={7})".format(
+              "(provenance: m3_only={4} m4_only={5} overlap={6} grown={7}) "
+              "roughness_ceiling={8:.5f}".format(
                   len(core0), len(fairing_region), len(active) - len(fairing_region),
                   len(active),
                   sum(1 for p in provenance.values() if p == "m3_only"),
                   sum(1 for p in provenance.values() if p == "m4_only"),
                   sum(1 for p in provenance.values() if p == "overlap"),
-                  sum(1 for p in provenance.values() if p == "grown")))
+                  sum(1 for p in provenance.values() if p == "grown"),
+                  roughness_ceiling))
 
     for it in range(1, int(max_iterations) + 1):
         x_before = [list(p) for p in x]
@@ -937,10 +1340,20 @@ def run_cleanup_solver(skin_mesh: str,
 
         local_edge = local_edge_lengths(x, neighbors, active_list)
         fair_w = {i: weights[i][0] for i in active_list}
-        m4_w = {i: weights[i][1] for i in active_list}
+        # Region-dependent shape restraint: weakest at the core (freedom to
+        # fair local defects, including Phase 0's own repair bumps), ramping
+        # to full strength across the transition band.
+        shape_w = {i: w_shape * shape_weight_from_anchor(anchor.get(i, 0.0), core_shape_scale)
+                  for i in active_list}
+        # M4 is guidance, not a final target: decay it once its improvement
+        # has plateaued (reuses the SAME patience signal as convergence)
+        # rather than pulling at full strength forever.
+        m4_decay_ratio = decay_m4_weight(1.0, patience["m4"], m4_decay_patience,
+                                         m4_decay_rate, m4_min_weight_fraction)
+        m4_w = {i: weights[i][1] * m4_decay_ratio for i in active_list}
 
         fair_f = fairing_force(x, neighbors, active_list, fair_w)
-        shape_f = shape_force(x, x_rest, active_list, w_shape)
+        shape_f = shape_force(x, x_rest, active_list, shape_w)
         m4_f = m4_force(x, m4_targets, active_list, m4_w)
 
         step = combine_step(fair_f, shape_f, m4_f, active_list, anchor,
@@ -957,35 +1370,53 @@ def run_cleanup_solver(skin_mesh: str,
 
         repair_result = None
         repair_disp: List[float] = []
+        repair_footprint: Set[int] = set()
         if core_now:
             x_accepted, repair_result = _repair_local(
                 x_projected, core_now, anatomy_backend, skin_mesh, neighbors,
                 normals, skin_topology, min_clearance, clearance_policy,
                 boundary_buffer_rings, intersection_tolerance, repair_kw)
             if repair_result:
-                patch = repair_result.get("patch_vertices") or []
+                # The broad repair's own patch growth (repair_blend_rings, ~6
+                # rings by default) is NOT clipped to this solver's active set
+                # -- verify and absorb the FULL footprint it actually touched,
+                # not just the pre-repair active vertices (see the module
+                # docstring: "repair patch validation footprint").
+                repair_footprint = set(repair_result.get("patch_vertices") or core_now)
                 repair_disp = [mesh_utils.vec_length(mesh_utils.vec_sub(x_accepted[i], x_projected[i]))
-                              for i in patch]
+                              for i in sorted(repair_footprint)]
         else:
             x_accepted = x_projected
 
         # Final local verification: the ACCEPTED state must be intersection-free
-        # within scope. If repair could not fully clear it (rare -- repair has
-        # its own bounded pass count), roll back ONLY the still-offending
-        # vertices, one component at a time -- never the whole iteration.
+        # over EVERY vertex this iteration could have touched -- the pre-repair
+        # active set AND whatever the repair patch grew into. If repair could
+        # not fully clear it (rare -- repair has its own bounded pass count),
+        # roll back ONLY the still-offending vertices, never the whole iteration.
+        verify_scope = sorted(set(active_list) | repair_footprint)
         residual_core, residual_report = _scoped_intersection_core(
-            skin_mesh, x_accepted, active_list, anatomy_backend, neighbors,
+            skin_mesh, x_accepted, verify_scope, anatomy_backend, neighbors,
             skin_topology, boundary_buffer_rings, intersection_tolerance)
         if residual_core:
             for i in residual_core:
                 x_accepted[i] = list(x_before[i])
             residual_core, residual_report = _scoped_intersection_core(
-                skin_mesh, x_accepted, active_list, anatomy_backend, neighbors,
+                skin_mesh, x_accepted, verify_scope, anatomy_backend, neighbors,
                 skin_topology, boundary_buffer_rings, intersection_tolerance)
 
         net_disp = [mesh_utils.vec_length(mesh_utils.vec_sub(x_accepted[i], x_before[i]))
                    for i in active_list]
         x = x_accepted
+
+        # Absorb anything the repair patch touched beyond the pre-repair active
+        # set into the region going forward, so it gets faired (not left as a
+        # frozen, untracked bump) and validated on every later iteration too.
+        grown_by_repair = repair_footprint - active
+        if grown_by_repair:
+            fairing_region, active, anchor = _absorb_vertices(
+                grown_by_repair, fairing_region, boundary, neighbors, transition_rings,
+                provenance, weights, floors, x, anatomy_backend, min_clearance,
+                clearance_policy, clearance_tolerance, w_fair, tag="repaired")
 
         roughness_after = mean_laplacian_magnitude(x, neighbors, sorted(fairing_region))
         m4_after = mean_target_disagreement(x, m4_targets, sorted(m4_targets.keys()))
@@ -997,6 +1428,8 @@ def run_cleanup_solver(skin_mesh: str,
         roughness_rel = abs(prev_roughness - roughness_after) / (prev_roughness + 1e-9)
         m4_rel = abs(prev_m4_disagreement - m4_after) / (prev_m4_disagreement + 1e-9)
         no_forbidden = not bool(residual_core)
+        repair_mean = _stats(repair_disp)["mean"]
+        proposal_clean = (isect_report.get("intersecting_skin_face_count", 0) == 0)
 
         tiny_motion = (mean_net < mean_displacement_tolerance
                       and max_net < max_displacement_tolerance)
@@ -1005,10 +1438,28 @@ def run_cleanup_solver(skin_mesh: str,
                                  if roughness_rel < roughness_rel_improvement_tolerance else 0)
         patience["m4"] = (patience["m4"] + 1
                           if (not m4_targets or m4_rel < m4_rel_improvement_tolerance) else 0)
+        patience["proposal_clean"] = patience["proposal_clean"] + 1 if proposal_clean else 0
+        patience["repair"] = (patience["repair"] + 1
+                              if repair_mean < repair_displacement_tolerance else 0)
+
+        # --- oscillation detection: a vertex repeatedly needing repair across
+        # iterations is a fair<->repair ping-pong, not progress. Once flagged,
+        # damp its fairing/M4 pull (once) so it holds its last safe position
+        # while the REST of the region keeps converging, instead of silently
+        # looping to max_iterations.
+        repair_history, oscillating = update_oscillation_tracker(
+            repair_history, core_now, oscillation_window, oscillation_repeat_threshold)
+        newly_oscillating = oscillating - damped_oscillating
+        for j in newly_oscillating:
+            if j in weights:
+                fw, mw = weights[j]
+                weights[j] = (fw * oscillation_damping, mw * oscillation_damping)
+            damped_oscillating.add(j)
 
         record = {
             "iteration": it,
             "active_count": len(active_list),
+            "w_m4_effective": w_m4 * m4_decay_ratio,
             "fairing_displacement": _stats([mesh_utils.vec_length(v) for v in fair_f.values()]),
             "m4_displacement": _stats([mesh_utils.vec_length(v) for v in m4_f.values()]),
             "shape_displacement": _stats([mesh_utils.vec_length(v) for v in shape_f.values()]),
@@ -1016,6 +1467,7 @@ def run_cleanup_solver(skin_mesh: str,
             "repair_displacement": _stats(repair_disp),
             "net_displacement": {"mean": mean_net, "max": max_net},
             "roughness": {"before": prev_roughness, "after": roughness_after},
+            "roughness_ceiling": roughness_ceiling,
             "m4_disagreement": {"before": prev_m4_disagreement, "after": m4_after},
             "intersections": {
                 "face_count": isect_report.get("intersecting_skin_face_count", 0),
@@ -1024,6 +1476,7 @@ def run_cleanup_solver(skin_mesh: str,
             },
             "min_exact_distance": min_dist_now,
             "no_forbidden_intersections": no_forbidden,
+            "oscillating_count": len(damped_oscillating),
             "patience": dict(patience),
         }
         iterations_log.append(record)
@@ -1031,19 +1484,25 @@ def run_cleanup_solver(skin_mesh: str,
 
         if verbose and (it == 1 or it % max(1, report_interval) == 0):
             print("  [iter {0:4d}] active={1} net disp mean/max={2:.5f}/{3:.5f} "
-                  "roughness {4:.5f}->{5:.5f} m4 {6:.5f}->{7:.5f} faces={8} "
-                  "min_dist={9:.4f} patience(m/r/4)={10}/{11}/{12}".format(
+                  "roughness {4:.5f}->{5:.5f} (ceiling {6:.5f}) m4 {7:.5f}->{8:.5f} "
+                  "w_m4={9:.4f} proposal_faces={10} repair_disp={11:.5f} "
+                  "osc={12} min_dist={13:.4f} patience(m/r/4/p/x)={14}/{15}/{16}/{17}/{18}".format(
                       it, len(active_list), mean_net, max_net, prev_roughness,
-                      roughness_after, prev_m4_disagreement, m4_after,
-                      record["intersections"]["face_count"], min_dist_now,
-                      patience["motion"], patience["roughness"], patience["m4"]))
+                      roughness_after, roughness_ceiling, prev_m4_disagreement, m4_after,
+                      record["w_m4_effective"], record["intersections"]["face_count"],
+                      repair_mean, len(damped_oscillating), min_dist_now,
+                      patience["motion"], patience["roughness"], patience["m4"],
+                      patience["proposal_clean"], patience["repair"]))
 
         prev_roughness = roughness_after
         prev_m4_disagreement = m4_after
 
-        if (no_forbidden and patience["motion"] >= convergence_patience
+        if (no_forbidden and roughness_after <= roughness_ceiling
+                and patience["motion"] >= convergence_patience
                 and patience["roughness"] >= convergence_patience
-                and patience["m4"] >= convergence_patience):
+                and patience["m4"] >= convergence_patience
+                and patience["proposal_clean"] >= convergence_patience
+                and patience["repair"] >= convergence_patience):
             converged = True
             stop_reason = STOP_CONVERGED
             break
@@ -1060,23 +1519,10 @@ def run_cleanup_solver(skin_mesh: str,
                     newly.append(j)
                     total_active_growth += 1
             if newly:
-                fairing_region |= set(newly)
-                region = build_active_region(sorted(fairing_region), neighbors, boundary,
-                                             0, transition_rings)
-                active = set(region["active"])
-                anchor = region["anchor"]
-                for j in newly:
-                    provenance[j] = "grown"
-                    weights[j] = (w_fair, 0.0)
-                new_active = sorted(active - set(floors.keys()))
-                if new_active:
-                    new_floors, _od, _pu = anatomy_constraint.compute_clearance_floors(
-                        x, new_active, anatomy_backend, min_clearance,
-                        clearance_policy=clearance_policy, clearance_tolerance=clearance_tolerance)
-                    floors.update(new_floors)
-                for j in active - set(weights.keys()):
-                    provenance[j] = "grown"
-                    weights[j] = (w_fair * 0.5, 0.0)
+                fairing_region, active, anchor = _absorb_vertices(
+                    newly, fairing_region, boundary, neighbors, transition_rings,
+                    provenance, weights, floors, x, anatomy_backend, min_clearance,
+                    clearance_policy, clearance_tolerance, w_fair, tag="grown")
                 if verbose:
                     print("  [iter {0:4d}] dynamic growth: +{1} vertices "
                           "(budget {2}/{3})".format(it, len(newly), total_active_growth,
@@ -1090,11 +1536,10 @@ def run_cleanup_solver(skin_mesh: str,
                 **dict(m5_detector_kwargs or {}))
             extra = sorted((set(new_idx) - active) - boundary)
             if extra:
-                fairing_region |= set(extra)
-                region = build_active_region(sorted(fairing_region), neighbors, boundary,
-                                             0, transition_rings)
-                active = set(region["active"])
-                anchor = region["anchor"]
+                fairing_region, active, anchor = _absorb_vertices(
+                    extra, fairing_region, boundary, neighbors, transition_rings,
+                    provenance, weights, floors, x, anatomy_backend, min_clearance,
+                    clearance_policy, clearance_tolerance, w_fair, tag="m3_only")
                 m3o, m4o, ov = _m5_provenance_sets(new_report)
                 for j in extra:
                     if j in ov:
@@ -1103,23 +1548,9 @@ def run_cleanup_solver(skin_mesh: str,
                     elif j in m4o:
                         provenance[j] = "m4_only"
                         weights[j] = (w_fair * m4_only_fair_scale, w_m4)
-                    else:
-                        provenance[j] = "m3_only"
-                        weights[j] = (w_fair, 0.0)
-                for j in active - set(weights.keys()):
-                    provenance[j] = "grown"
-                    weights[j] = (w_fair * 0.5, 0.0)
                 more_m4 = sorted(j for j in extra if weights[j][1] > 0.0)
                 if more_m4:
-                    m4_targets.update(_compute_m4_targets(
-                        skin_mesh, valid_anatomical_meshes, target_offset, more_m4,
-                        sdf_query=sdf_query))
-                new_active = sorted(active - set(floors.keys()))
-                if new_active:
-                    new_floors, _od, _pu = anatomy_constraint.compute_clearance_floors(
-                        x, new_active, anatomy_backend, min_clearance,
-                        clearance_policy=clearance_policy, clearance_tolerance=clearance_tolerance)
-                    floors.update(new_floors)
+                    m4_targets.update(_compute_m4_targets(x, more_m4, sdf_query, target_offset))
                 if verbose:
                     print("  [iter {0:4d}] M5 redetect: +{1} vertices".format(it, len(extra)))
     else:
@@ -1197,11 +1628,19 @@ def run_cleanup_solver(skin_mesh: str,
             "after": {"face_count": whole_report.get("intersecting_skin_face_count", 0),
                      "pair_count": whole_report.get("intersection_pair_count", 0)},
         },
-        "roughness": {"before": roughness0, "after": prev_roughness},
+        "feasibility": {k: v for k, v in feasibility.items() if k != "positions"},
+        "roughness": {
+            "before": roughness_original,           # ORIGINAL registered skin (honest headline metric)
+            "after": prev_roughness,
+            "post_feasibility": roughness0,          # start of the iterative loop (after Phase 0 only)
+            "ceiling": roughness_ceiling,
+        },
         "m4_disagreement": {"before": m4_disagreement0, "after": prev_m4_disagreement},
         "min_exact_anatomy_distance": {"before": min_dist0,
                                       "after": min((anatomy_backend.exact_closest(x[i])["distance"]
                                                   for i in final_active), default=float("inf"))},
+        "oscillating_vertices": {"count": len(damped_oscillating),
+                                "vertices": sorted(damped_oscillating)},
         "total_displacement": total_disp,
         "whole_mesh_displacement": whole_disp,
         "unresolved": unresolved,
@@ -1211,6 +1650,11 @@ def run_cleanup_solver(skin_mesh: str,
         "config": {
             "cleanup_growth_rings": cleanup_growth_rings, "transition_rings": transition_rings,
             "w_fair": w_fair, "w_m4": w_m4, "w_shape": w_shape,
+            "core_shape_scale": core_shape_scale,
+            "m4_decay_patience": m4_decay_patience, "m4_decay_rate": m4_decay_rate,
+            "max_roughness_ratio": max_roughness_ratio,
+            "oscillation_window": oscillation_window,
+            "oscillation_repeat_threshold": oscillation_repeat_threshold,
             "max_step_edge_ratio": max_step_edge_ratio,
             "dynamic_active_set": dynamic_active_set, "redetect_every": redetect_every,
             "max_iterations": max_iterations, "convergence_patience": convergence_patience,
@@ -1249,13 +1693,29 @@ def print_final_cleanup_report(result: Dict[str, Any]) -> None:
     print("stop reason: {0}".format(result.get("stop_reason")))
     if result.get("dry_run"):
         print("(dry run -- scene NOT modified)")
+    feas = result.get("feasibility") or {}
+    if feas.get("passes", 0) > 0:
+        print("Phase 0 (initial feasibility): {0} pass(es), resolved={1}".format(
+            feas.get("passes", 0), feas.get("resolved")))
+        print("  intersections: {0} -> {1} faces".format(
+            feas.get("pre_intersections", {}).get("face_count", 0),
+            feas.get("post_intersections", {}).get("face_count", 0)))
+        print("  displacement: mean={0:.5f} max={1:.5f} ({2} vertices touched)".format(
+            feas.get("displacement", {}).get("mean", 0.0),
+            feas.get("displacement", {}).get("max", 0.0),
+            feas.get("displacement", {}).get("count", 0)))
     isect = result.get("intersections") or {}
     b, a = isect.get("before", {}), isect.get("after", {})
     print("intersections (faces): {0} -> {1}".format(
         b.get("face_count", 0), a.get("face_count", 0)))
     rough = result.get("roughness") or {}
-    print("roughness (mean Laplacian magnitude): {0:.5f} -> {1:.5f}".format(
-        rough.get("before", 0.0), rough.get("after", 0.0)))
+    print("roughness (mean Laplacian magnitude): {0:.5f} -> {1:.5f}  "
+          "(ceiling {2:.5f}; post-Phase-0 start was {3:.5f})".format(
+        rough.get("before", 0.0), rough.get("after", 0.0),
+        rough.get("ceiling", 0.0), rough.get("post_feasibility", 0.0)))
+    if rough.get("after", 0.0) > rough.get("ceiling", float("inf")):
+        print("  WARNING: final roughness exceeds the ceiling -- the surface is "
+              "not yet FAIR, not just anatomically unsafe.")
     m4 = result.get("m4_disagreement") or {}
     print("M4 target disagreement: {0:.5f} -> {1:.5f}".format(
         m4.get("before", 0.0), m4.get("after", 0.0)))
@@ -1273,6 +1733,17 @@ def print_final_cleanup_report(result: Dict[str, Any]) -> None:
     print("provenance: m3_only={0} m4_only={1} overlap={2} grown={3}".format(
         prov.get("m3_only", 0), prov.get("m4_only", 0), prov.get("overlap", 0),
         prov.get("grown", 0)))
+    osc = result.get("oscillating_vertices") or {}
+    if osc.get("count", 0) > 0:
+        print("oscillation detected & damped: {0} vertex(es) (repeatedly needed repair; "
+              "held at last safe position -- see 'oscillating_vertices')".format(
+                  osc.get("count", 0)))
+    if result.get("iterations_log"):
+        last = result["iterations_log"][-1]
+        print("last-iteration repair displacement: mean={0:.5f} max={1:.5f} "
+              "| proposal faces={2}".format(
+                  last["repair_displacement"]["mean"], last["repair_displacement"]["max"],
+                  last["intersections"]["face_count"]))
     unresolved = result.get("unresolved")
     if unresolved:
         print("UNRESOLVED: {0} face(s); anatomy meshes: {1}".format(

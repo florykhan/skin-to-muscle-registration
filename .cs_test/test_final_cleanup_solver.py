@@ -150,6 +150,38 @@ approx("target disagreement = distance to target, ignores untargeted verts",
       disagree, 5.0)
 
 
+print("\nA6. shape_weight_from_anchor / decay_m4_weight / oscillation tracker")
+approx("core (anchor=0) uses core_shape_scale",
+      fcs.shape_weight_from_anchor(0.0, 0.3), 0.3)
+approx("outer transition (anchor=1) uses full strength",
+      fcs.shape_weight_from_anchor(1.0, 0.3), 1.0)
+approx("midway transition is the midpoint",
+      fcs.shape_weight_from_anchor(0.5, 0.3), 0.65)
+
+approx("m4 decay: no decay before decay_patience",
+      fcs.decay_m4_weight(1.0, plateau_streak=1, decay_patience=2, decay_rate=0.5), 1.0)
+approx("m4 decay: full weight AT decay_patience-1... i.e. streak==patience is first decayed step",
+      fcs.decay_m4_weight(1.0, plateau_streak=2, decay_patience=2, decay_rate=0.5), 0.5)
+approx("m4 decay: geometric after that",
+      fcs.decay_m4_weight(1.0, plateau_streak=3, decay_patience=2, decay_rate=0.5), 0.25)
+approx("m4 decay: floored at min_fraction",
+      fcs.decay_m4_weight(1.0, plateau_streak=20, decay_patience=2, decay_rate=0.5,
+                          min_fraction=0.1), 0.1)
+
+hist = []
+hist, osc = fcs.update_oscillation_tracker(hist, [5, 9], window=5, threshold=3)
+check("1st iter: nobody oscillating yet", osc == set())
+hist, osc = fcs.update_oscillation_tracker(hist, [5], window=5, threshold=3)
+check("2nd iter: still under threshold", osc == set())
+hist, osc = fcs.update_oscillation_tracker(hist, [5, 12], window=5, threshold=3)
+check("3rd iter: vertex 5 hit threshold (3 of last 3)", osc == {5}, str(osc))
+check("vertex 9 (appeared once) not flagged", 9 not in osc)
+# window eviction: after 5 more clean iterations, vertex 5 ages out of the window
+for _ in range(5):
+    hist, osc = fcs.update_oscillation_tracker(hist, [], window=5, threshold=3)
+check("old offender ages out of the rolling window", osc == set(), str(osc))
+
+
 # =============================================================================
 # PART B: repair integration point (resolve_skin_anatomy_intersections),
 # exercised directly and in isolation before trusting it inside the solver loop
@@ -222,6 +254,31 @@ check("repair actually cleared the intersection",
 check("_repair_local with an empty core is a no-op",
       fcs._repair_local(skin_pts, [], backend, None, skin_nbrs, None, skin_topo,
                        0.1, "global", 0, 1e-6, {})[1] is None)
+
+
+print("\nB2. _absorb_vertices: repair-driven growth gets the same bookkeeping "
+     "as dynamic growth / redetect (validated, not silently untracked)")
+positions_path = [[float(i), 1.0, 0.0] for i in range(9)]  # safely above the FlatPlaneBackend's y=0
+fairing0 = {4}
+provenance0 = {4: "m3_only"}
+weights0 = {4: (0.5, 0.0)}
+floors0 = {4: 0.1}
+new_fairing, new_active, new_anchor = fcs._absorb_vertices(
+    [3, 5], fairing0, set(), path_neighbors, 2, provenance0, weights0, floors0,
+    positions_path, backend, 0.1, "global", 1e-4, 0.5, tag="repaired")
+check("newly absorbed vertices join the fairing region", {3, 4, 5} <= new_fairing)
+check("absorbed vertices are tagged with the given provenance",
+      provenance0.get(3) == "repaired" and provenance0.get(5) == "repaired")
+check("absorbed vertices get a default fairing-only weight",
+      weights0.get(3) == (0.5, 0.0) and weights0.get(5) == (0.5, 0.0))
+check("absorbed vertices get a clearance floor (not left unfloored)",
+      3 in floors0 and 5 in floors0)
+check("region regrows a transition band around the new fairing set",
+      len(new_active) > len(new_fairing))
+check("absorbing an empty set is a safe no-op",
+      fcs._absorb_vertices([], new_fairing, set(), path_neighbors, 2, provenance0, weights0,
+                          floors0, positions_path, backend, 0.1, "global", 1e-4, 0.5,
+                          tag="repaired")[0] == new_fairing)
 
 
 # =============================================================================
@@ -301,6 +358,17 @@ mesh_utils.get_triangle_topology = lambda mesh_fn: grid_topo
 mesh_utils.get_boundary_vertices = lambda name: set(grid_boundary)
 mesh_utils.grow_indices = _orig["grow_indices"]  # pure function, safe to reuse
 mesh_utils.select_vertices = lambda name, idxs, replace=True: None
+
+# anatomy_constraint.py does `from mesh_utils import get_boundary_vertices` (a name
+# import), so patching mesh_utils.get_boundary_vertices above does NOT reach the name
+# bound inside anatomy_constraint's own namespace -- its internal repair-patch-growth
+# boundary lookup (_buffered_boundary_vertices) would otherwise silently see an empty
+# boundary and let the repair patch grow into the "protected" perimeter. Patch it here
+# too, the same way test_safe_smoothing_step.py patches names on smoothing_utils. In
+# real Maya this gap does not exist: get_boundary_vertices(skin_mesh) is the same real
+# call either way.
+_orig["ac_get_boundary_vertices"] = ac.get_boundary_vertices
+ac.get_boundary_vertices = lambda name: set(grid_boundary)
 
 
 class DeepPlaneBackend(object):
@@ -392,7 +460,93 @@ try:
     check("result carries no hidden dependency on globals (plain dict, self-contained)",
           isinstance(result, dict) and "skin_mesh" in result and "iterations_log" in result)
 
+    print("\nC2. Phase-0 regression test: an initial REAL intersection is repaired "
+         "before the rest reference is captured; repair does not fight shape restraint")
+    positions0_c2 = [list(p) for p in positions0]
+    for i in range(len(positions0_c2)):
+        positions0_c2[i][1] = 0.5
+    positions0_c2[center_v][1] = -0.3  # dips THROUGH the anatomy plane -- a REAL initial intersection
+
+    store["verts"] = [list(p) for p in positions0_c2]
+    store["written"] = False
+    # boundary_buffer_rings=0 here: on this tiny 5x5 test grid, a 1-ring buffer
+    # around the perimeter (meant, on a real 16k-vertex face, to margin tiny
+    # eye/mouth/nostril openings) swallows rows/cols 1 and 3 too, leaving only
+    # the center cross as "interior" and excluding every face touching the
+    # center from the intersection scan as boundary noise. The TRUE boundary
+    # (the grid perimeter itself) is still fully protected either way.
+    result_c2 = fcs.run_cleanup_solver(
+        "grid_skin", ["floor"], target_offset=0.1, min_clearance=0.1,
+        indices=[center_v], anatomy_backend=backend2, sdf_query=object(),
+        cleanup_growth_rings=1, transition_rings=1, dynamic_active_set=False,
+        boundary_buffer_rings=0,
+        max_iterations=60, convergence_patience=3, apply=True, verbose=False,
+        create_backup=False, save_json=False, save_csv=False)
+
+    feas = result_c2["feasibility"]
+    check("setup: there really was a pre-existing intersection to fix",
+          feas["pre_intersections"]["face_count"] > 0, str(feas))
+    check("Phase 0 resolved it before the iterative loop started",
+          feas["resolved"] is True and feas["post_intersections"]["face_count"] == 0, str(feas))
+
+    log = result_c2["iterations_log"]
+    check("iteration 1 shape displacement is ~0 -- x_rest was captured AFTER Phase 0 "
+         "(x == x_rest at the start of the loop), NOT from the raw invalid original "
+         "(the actual root cause of the reported bug)",
+         log[0]["shape_displacement"]["mean"] < 1e-9, str(log[0]["shape_displacement"]))
+
+    repair_means = [r["repair_displacement"]["mean"] for r in log]
+    early_peak = max(repair_means[:3]) if len(repair_means) >= 3 else repair_means[0]
+    check("repair workload decays (or was never re-triggered): no persistent "
+         "fair -> repair -> fair -> repair cycle",
+         repair_means[-1] <= early_peak * 0.5 + 1e-9 or max(repair_means) < 1e-6,
+         str(repair_means))
+    check("run converged to a genuinely valid state", result_c2["converged"] is True,
+          str(result_c2["stop_reason"]))
+    check("no oscillation damping was needed to get there (this is the real fix, "
+         "not a band-aid over a still-fighting solver)",
+         result_c2["oscillating_vertices"]["count"] == 0,
+         str(result_c2["oscillating_vertices"]))
+    check("final roughness is within the ceiling -- roughness is now a real "
+         "acceptance/convergence target, not just a logged number",
+         result_c2["roughness"]["after"] <= result_c2["roughness"]["ceiling"] + 1e-9,
+         str(result_c2["roughness"]))
+    check("protected boundary still untouched in this scenario too",
+          all(store["verts"][b] == positions0_c2[b] for b in grid_boundary))
+
+    print("\nC3. max_iterations beyond the convergence point gives the SAME final mesh")
+    store["verts"] = [list(p) for p in positions0]
+    result_30 = fcs.run_cleanup_solver(
+        "grid_skin", ["floor"], target_offset=0.3, min_clearance=0.1,
+        indices=[center_v], anatomy_backend=backend2, sdf_query=object(),
+        cleanup_growth_rings=1, transition_rings=1, dynamic_active_set=False,
+        max_iterations=30, convergence_patience=3, apply=True, verbose=False,
+        create_backup=False, save_json=False, save_csv=False)
+    final_30 = [list(v) for v in store["verts"]]
+
+    store["verts"] = [list(p) for p in positions0]
+    result_80 = fcs.run_cleanup_solver(
+        "grid_skin", ["floor"], target_offset=0.3, min_clearance=0.1,
+        indices=[center_v], anatomy_backend=backend2, sdf_query=object(),
+        cleanup_growth_rings=1, transition_rings=1, dynamic_active_set=False,
+        max_iterations=80, convergence_patience=3, apply=True, verbose=False,
+        create_backup=False, save_json=False, save_csv=False)
+    final_80 = [list(v) for v in store["verts"]]
+
+    check("both runs converged (stopped themselves, not by hitting the cap)",
+          result_30["converged"] and result_80["converged"],
+          "{0} / {1}".format(result_30["stop_reason"], result_80["stop_reason"]))
+    check("same convergence iteration regardless of max_iterations headroom",
+          result_30["iterations"] == result_80["iterations"],
+          "{0} vs {1}".format(result_30["iterations"], result_80["iterations"]))
+    max_pos_diff = max(mesh_utils.vec_length(mesh_utils.vec_sub(a, b))
+                       for a, b in zip(final_30, final_80))
+    check("more max_iterations headroom does not change the final geometry "
+         "(does not keep shrinking/deforming once converged)",
+         max_pos_diff < 1e-9, "max diff={0}".format(max_pos_diff))
+
 finally:
+    ac.get_boundary_vertices = _orig.pop("ac_get_boundary_vertices")
     for name, fn in _orig.items():
         setattr(mesh_utils, name, fn)
 
