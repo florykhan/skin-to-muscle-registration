@@ -341,6 +341,114 @@ check("analyzer detail has anatomy_mesh",
       "anatomy_mesh" in rep13["details"][0])
 check("analyzer does not repair",
       "repair_mode" not in rep13)
+check("test-1 intersecting face count still 1",
+      rep13["intersecting_skin_face_count"] == 1)
+
+
+print("14. repair profiles, rings, components, overlap, boundary")
+spec_l = ac._apply_repair_profile("legacy_v2_local")
+spec_b = ac._apply_repair_profile("broad_fair")
+check("legacy profile rings=2", spec_l["repair_blend_rings"] == 2)
+check("legacy profile fixed boundary", spec_l["repair_boundary_mode"] == "fixed")
+check("broad profile rings=6", spec_b["repair_blend_rings"] == 6)
+check("broad profile soft boundary", spec_b["repair_boundary_mode"] == "soft")
+check("explicit rings override profile",
+      ac._apply_repair_profile("broad_fair", repair_blend_rings=8)[
+          "repair_blend_rings"] == 8)
+
+comps = ac._connected_index_components(
+    [0, 1, 5, 6], [[1], [0, 2], [1], [], [], [6], [5]])
+check("two disconnected core components",
+      len(comps) == 2 and {0, 1} in [set(c) for c in comps]
+      and {5, 6} in [set(c) for c in comps])
+
+pA = ac._build_intersection_repair_patch(
+    [0], [[1], [0, 2], [1, 3], [2, 4], [3]], allowed=set(range(5)),
+    boundary=set(), blend_rings=2)
+pB = ac._build_intersection_repair_patch(
+    [4], [[1], [0, 2], [1, 3], [2, 4], [3]], allowed=set(range(5)),
+    boundary=set(), blend_rings=2)
+merged = ac._merge_overlapping_repair_patches([pA, pB])
+check("overlapping grown patches merge",
+      len(merged) == 1 and merged[0].get("_rebuild") is True)
+pFar = ac._build_intersection_repair_patch(
+    [0], [[1], [0], [], [], [], [], [5], [6]],
+    allowed=set(range(8)), boundary=set(), blend_rings=1)
+pFar2 = ac._build_intersection_repair_patch(
+    [7], [[1], [0], [], [], [], [], [5], [6]],
+    allowed=set(range(8)), boundary=set(), blend_rings=1)
+merged2 = ac._merge_overlapping_repair_patches([pFar, pFar2])
+check("disjoint patches stay separate", len(merged2) == 2)
+
+p_bound = ac._build_intersection_repair_patch(
+    [0], [[1], [0, 2], [1, 3], [2]], allowed={0, 1, 2}, boundary={3},
+    blend_rings=6)
+check("excluded boundary never enters patch",
+      3 not in p_bound["patch"] and 3 not in p_bound["core"])
+check("distance map stored", p_bound.get("distance", {}).get(0) == 0)
+
+chain_n = [[1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 6], [5, 7], [6, 8], [7]]
+p2 = ac._build_intersection_repair_patch(
+    [4], chain_n, allowed=set(range(9)), boundary=set(), blend_rings=2)
+p6 = ac._build_intersection_repair_patch(
+    [4], chain_n, allowed=set(range(9)), boundary=set(), blend_rings=6)
+check("6-ring patch larger than 2-ring",
+      len(p6["patch"]) > len(p2["patch"]))
+check("2-ring does not reach chain ends",
+      0 not in p2["patch"] and 8 not in p2["patch"])
+check("6-ring can reach farther neighbors",
+      1 in p6["patch"] or 7 in p6["patch"])
+
+core_d = {4: [0.0, 1.0, 0.0]}
+field_h = ac._blend_patch_displacements(
+    core_d, p6, chain_n, method="harmonic", harmonic_iters=50,
+    falloff="harmonic", boundary_mode="soft")
+check("core displacement stays min lift",
+      abs(field_h[4][1] - 1.0) < 1e-8)
+outer6 = p6.get("outer") or []
+if outer6:
+    check("outer ring ~ zero displacement",
+          max((sum(x * x for x in field_h.get(i, [0, 0, 0])) ** 0.5)
+              for i in outer6) < 0.05)
+
+v2_local = ac.resolve_skin_anatomy_intersections(
+    [list(p) for p in skin_pts], [0, 1, 2], backend,
+    neighbors=neighbors, normals=normals, skin_topology=skin_topo,
+    min_clearance=None, boundary_buffer_rings=0,
+    repair_mode="anatomy_supported_patch",
+    repair_profile="legacy_v2_local",
+    repair_blend_rings=2, post_repair_relax=False, verbose=False)
+v2_broad = ac.resolve_skin_anatomy_intersections(
+    [list(p) for p in skin_pts], [0, 1, 2], backend,
+    neighbors=neighbors, normals=normals, skin_topology=skin_topo,
+    min_clearance=None, boundary_buffer_rings=0,
+    repair_mode="anatomy_supported_patch",
+    repair_profile="broad_fair",
+    repair_blend_rings=6, repair_field_iterations=50,
+    repair_boundary_mode="soft", post_repair_relax=False, verbose=False)
+check("legacy profile recorded", v2_local.get("repair_profile") == "legacy_v2_local")
+check("broad profile recorded", v2_broad.get("repair_profile") == "broad_fair")
+check("legacy rings=2", v2_local.get("repair_blend_rings") == 2)
+check("broad rings=6", v2_broad.get("repair_blend_rings") == 6)
+check("new patch metrics present",
+      "repair_component_count" in v2_broad
+      and "core_max_displacement" in v2_broad
+      and "laplacian_roughness_after" in v2_broad)
+check("component count >= 1 when intersections exist",
+      v2_broad.get("repair_component_count", 0) >= 1)
+check("detector output before repair is still the analyzer report",
+      v2_broad["report_before"]["intersecting_skin_face_count"]
+      == rep["intersecting_skin_face_count"])
+
+
+print("15. select helpers expose core/patch/outer/component")
+check("outer_vertices key present", "outer_vertices" in v2_broad)
+check("patch_distance key present", isinstance(v2_broad.get("patch_distance"), dict))
+comps_r = v2_broad.get("repair_components") or []
+if comps_r:
+    check("component stores core/patch lists",
+          "core_vertices" in comps_r[0] and "patch_vertices" in comps_r[0])
+
 
 if fails:
     print("\nFAILED {0}: {1}".format(len(fails), fails))

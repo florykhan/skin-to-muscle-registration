@@ -184,6 +184,78 @@ try:
         skin_topology=topo,
         unsafe_step_policy="rollback")
     check("rollback policy recorded", m_rb["unsafe_step_policy"] == "rollback")
+    check("strict is the default safety_mode",
+          m_ls.get("safety_mode") == "strict")
+    store.pop("written", None)
+    calls = {"repair": 0, "project": 0}
+    orig_repair = su.anatomy_constraint.resolve_skin_anatomy_intersections
+    orig_proj = su._apply_iteration_constraints
+
+    def _repair_count(*a, **k):
+        calls["repair"] += 1
+        return orig_repair(*a, **k)
+
+    def _proj_count(*a, **k):
+        calls["project"] += 1
+        return orig_proj(*a, **k)
+
+    su.anatomy_constraint.resolve_skin_anatomy_intersections = _repair_count
+    su._apply_iteration_constraints = _proj_count
+    try:
+        m_off = su.constrained_smooth_mesh_region(
+            "skin", [1], plane.sdf_query, 0.01,
+            method="laplacian", strength=0.2, iterations=4,
+            anatomy_backend=plane, constraint_solver="iterative_exact",
+            resolve_initial_penetration=False,
+            resolve_initial_surface_intersections=False,
+            prevent_surface_intersections=True,
+            prevent_segment_crossing=True, preserve_tangential=True,
+            clearance_policy="global", apply=False, verbose=False,
+            skin_topology=topo, safety_mode="off")
+        check("off apply=False does not write", store.get("written") is not True)
+        check("off safety_disabled flag", m_off.get("safety_disabled") is True)
+        check("off does not call intersection repair", calls["repair"] == 0,
+              str(calls))
+        check("off does not call safety projection", calls["project"] == 0,
+              str(calls))
+        check("off still reports intersection counts",
+              "intersecting_skin_face_count_before" in m_off
+              and "intersecting_skin_face_count_after" in m_off)
+        check("off safety_decline present", "safety_decline" in m_off)
+        store.pop("written", None)
+        calls["repair"] = 0
+        calls["project"] = 0
+        m_batch = su.constrained_smooth_mesh_region(
+            "skin", [1], plane.sdf_query, 0.01,
+            method="laplacian", strength=0.2, iterations=4,
+            anatomy_backend=plane, constraint_solver="iterative_exact",
+            resolve_initial_penetration=False,
+            resolve_initial_surface_intersections=False,
+            prevent_surface_intersections=True,
+            prevent_segment_crossing=True, preserve_tangential=True,
+            clearance_policy="global", apply=False, verbose=False,
+            skin_topology=topo, safety_mode="repair_after_batch",
+            safety_batch_iterations=2)
+        check("batch apply=False does not write", store.get("written") is not True)
+        check("batch_count is 2 for 4 iters / 2",
+              m_batch.get("batch_count") == 2, str(m_batch.get("batch_count")))
+        check("batch calls V2 repair (not per-iter projection)",
+              calls["repair"] >= 2 and calls["project"] == 0, str(calls))
+        check("batch reports have repair keys",
+              m_batch.get("batch_reports")
+              and "intersections_after_smoothing" in m_batch["batch_reports"][0]
+              and "intersections_after_repair" in m_batch["batch_reports"][0])
+        check("alias allow_safety_decline maps to batch",
+              su._normalize_safety_mode(None, True) == "repair_after_batch")
+        raised = False
+        try:
+            su._normalize_safety_mode("off", True)
+        except ValueError:
+            raised = True
+        check("conflicting alias+mode raises", raised)
+    finally:
+        su.anatomy_constraint.resolve_skin_anatomy_intersections = orig_repair
+        su._apply_iteration_constraints = orig_proj
 finally:
     su._local_intersection_report = orig_local
 
