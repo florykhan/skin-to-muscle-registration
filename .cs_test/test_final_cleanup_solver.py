@@ -150,23 +150,13 @@ approx("target disagreement = distance to target, ignores untargeted verts",
       disagree, 5.0)
 
 
-print("\nA6. shape_weight_from_anchor / decay_m4_weight / oscillation tracker")
+print("\nA6. shape_weight_from_anchor / oscillation tracker")
 approx("core (anchor=0) uses core_shape_scale",
       fcs.shape_weight_from_anchor(0.0, 0.3), 0.3)
 approx("outer transition (anchor=1) uses full strength",
       fcs.shape_weight_from_anchor(1.0, 0.3), 1.0)
 approx("midway transition is the midpoint",
       fcs.shape_weight_from_anchor(0.5, 0.3), 0.65)
-
-approx("m4 decay: no decay before decay_patience",
-      fcs.decay_m4_weight(1.0, plateau_streak=1, decay_patience=2, decay_rate=0.5), 1.0)
-approx("m4 decay: full weight AT decay_patience-1... i.e. streak==patience is first decayed step",
-      fcs.decay_m4_weight(1.0, plateau_streak=2, decay_patience=2, decay_rate=0.5), 0.5)
-approx("m4 decay: geometric after that",
-      fcs.decay_m4_weight(1.0, plateau_streak=3, decay_patience=2, decay_rate=0.5), 0.25)
-approx("m4 decay: floored at min_fraction",
-      fcs.decay_m4_weight(1.0, plateau_streak=20, decay_patience=2, decay_rate=0.5,
-                          min_fraction=0.1), 0.1)
 
 hist = []
 hist, osc = fcs.update_oscillation_tracker(hist, [5, 9], window=5, threshold=3)
@@ -180,6 +170,119 @@ check("vertex 9 (appeared once) not flagged", 9 not in osc)
 for _ in range(5):
     hist, osc = fcs.update_oscillation_tracker(hist, [], window=5, threshold=3)
 check("old offender ages out of the rolling window", osc == set(), str(osc))
+
+
+print("\nA7. persistent, monotonic M4 decay -- the actual reported-bug regression test")
+# decay_m4_weight is now a pure ONE-STEP ratchet: caller owns the persistent state.
+approx("ratchet step: one decay", fcs.decay_m4_weight(1.0, decay_rate=0.5, floor=0.0), 0.5)
+approx("ratchet step: floored", fcs.decay_m4_weight(0.02, decay_rate=0.5, floor=0.1), 0.1)
+approx("ratchet step never increases even if given a tiny current value",
+      fcs.decay_m4_weight(0.05, decay_rate=0.5, floor=0.0), 0.025)
+
+check("m4_is_improving: a real decrease beyond tolerance is improving",
+      fcs.m4_is_improving(prev_disagreement=10.0, disagreement=8.0,
+                         rel_improvement_tolerance=0.01) is True)
+check("m4_is_improving: flat is NOT improving", not fcs.m4_is_improving(
+      prev_disagreement=10.0, disagreement=9.99, rel_improvement_tolerance=0.01))
+check("m4_is_improving: a REGRESSION (disagreement got WORSE) is NOT improving "
+     "-- this is the exact fix: it must NOT reset the plateau streak",
+     not fcs.m4_is_improving(prev_disagreement=2.30731, disagreement=2.46853,
+                            rel_improvement_tolerance=0.01))
+
+check("should_decay_m4: fires at streak==decay_patience", fcs.should_decay_m4(2, 2))
+check("should_decay_m4: fires again at 2x decay_patience (keeps ratcheting)",
+      fcs.should_decay_m4(4, 2))
+check("should_decay_m4: does not fire between multiples", not fcs.should_decay_m4(3, 2))
+check("should_decay_m4: does not fire at streak 0 (not plateaued)",
+      not fcs.should_decay_m4(0, 2))
+
+print("  replaying the REAL reported trajectory (iterations 13-16, w_m4=0.25, "
+     "decay_rate=0.7, decay_patience=2, tolerance=0.01):")
+w_m4 = 0.25
+w_m4_effective = w_m4
+streak = 0
+# (prev_m4, m4_after) pairs exactly as reported for iterations 13, 14, 15, 16
+real_trace = [
+    (2.34664, 2.32656),  # iter 13: still improving -> streak resets to 0 after
+    (2.32656, 2.30731),  # iter 14: still improving
+    (2.30731, 2.46853),  # iter 15: DECAY FIRES this iteration (using streak entering=2)
+    (2.46853, 2.27719),  # iter 16 (using the REAL iter16->20 M4 value as a stand-in decrease)
+]
+effective_log = []
+for prev_m4, m4_after in real_trace:
+    effective_log.append(w_m4_effective)          # weight USED this iteration (state entering)
+    improving = fcs.m4_is_improving(prev_m4, m4_after, 0.01)
+    streak = 0 if improving else streak + 1
+    if fcs.should_decay_m4(streak, 2):
+        w_m4_effective = fcs.decay_m4_weight(w_m4_effective, 0.7, 0.0)
+check("iter 13 used full weight (still improving)", effective_log[0] == 0.25)
+check("iter 14 used full weight (still improving, streak not yet at patience)",
+      effective_log[1] == 0.25)
+approx("iter 15 decays to 0.175 -- matches the real trace exactly", effective_log[2], 0.175)
+approx("iter 16 STAYS at 0.175 -- the actual fix. Under the OLD (buggy) logic this "
+      "snapped back to 0.25 because M4 got worse at iter 15 (a regression, which "
+      "used to incorrectly reset the plateau streak)",
+      effective_log[3], 0.175)
+
+print("\nA8. classify_phase / force_opposition / provenance_buckets")
+check("full M4 strength, still active -> anatomy_correction",
+      fcs.classify_phase(0.25, 0.25, 0.0, 5, 0.1, 0.01) == "anatomy_correction")
+check("M4 partially decayed -> balanced_cleanup",
+      fcs.classify_phase(0.175, 0.25, 0.0, 5, 0.1, 0.01) == "balanced_cleanup")
+check("M4 at floor but surface still noisy -> balanced_cleanup (not finishing yet)",
+      fcs.classify_phase(0.0, 0.25, 0.0, 5, 0.1, 0.01) == "balanced_cleanup")
+check("M4 at floor AND surface quiet -> fairing_finish",
+      fcs.classify_phase(0.0, 0.25, 0.0, 1, 0.001, 0.01) == "fairing_finish")
+
+opposing = {0: [1.0, 0.0, 0.0], 1: [0.0, 1.0, 0.0]}
+reinforcing_a = {0: [1.0, 0.0, 0.0], 1: [0.0, 1.0, 0.0]}
+reinforcing_b = {0: [2.0, 0.0, 0.0], 1: [0.0, 2.0, 0.0]}
+opposing_b = {0: [-1.0, 0.0, 0.0], 1: [0.0, -1.0, 0.0]}
+op_reinforce = fcs.force_opposition(reinforcing_a, reinforcing_b, [0, 1])
+approx("perfectly aligned forces -> cosine +1", op_reinforce["mean_cosine"], 1.0)
+op_oppose = fcs.force_opposition(reinforcing_a, opposing_b, [0, 1])
+approx("perfectly opposed forces -> cosine -1", op_oppose["mean_cosine"], -1.0)
+check("opposing_fraction reflects it", op_oppose["opposing_fraction"] == 1.0)
+op_missing = fcs.force_opposition({0: [1.0, 0.0, 0.0]}, {}, [0, 1])
+check("vertices missing from either field are skipped, not treated as zero-opposition",
+      op_missing["count"] == 0)
+
+buckets = fcs.provenance_buckets([1, 2, 3, 4], {1: "m3_only", 2: "m4_only", 3: "overlap"},
+                                 oscillating={2})
+check("oscillating overrides original provenance tag", buckets.get("oscillating") == [2])
+check("m4_only lost vertex 2 to the oscillating bucket", buckets.get("m4_only") is None)
+check("untagged vertex 4 falls back to 'grown'", buckets.get("grown") == [4])
+
+
+print("\nA9. is_better_state (best-feasible-state ranking rule)")
+check("strictly lower roughness wins outright",
+      fcs.is_better_state(roughness=0.20, m4_disagreement=5.0,
+                          best_roughness=0.25, best_m4=1.0))
+check("higher roughness never wins, regardless of M4",
+      not fcs.is_better_state(roughness=0.30, m4_disagreement=0.0,
+                             best_roughness=0.25, best_m4=5.0))
+check("roughness tie broken by lower M4 disagreement",
+      fcs.is_better_state(roughness=0.25, m4_disagreement=0.9,
+                         best_roughness=0.25, best_m4=1.0))
+check("roughness tie with WORSE M4 does not win",
+      not fcs.is_better_state(roughness=0.25, m4_disagreement=1.1,
+                             best_roughness=0.25, best_m4=1.0))
+check("first state ever seen (best=inf) always wins",
+      fcs.is_better_state(roughness=0.257, m4_disagreement=2.28,
+                         best_roughness=float("inf"), best_m4=float("inf")))
+
+
+print("\nA10. _smooth_rest_reference: low-pass filters ONLY the given indices")
+bumpy_ref = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 5.0, 0.0], [0.0, -5.0, 0.0]]
+ref_nbrs = [[1, 2, 3, 4], [0], [0], [0], [0]]
+smoothed = fcs._smooth_rest_reference(bumpy_ref, ref_nbrs, [0], iterations=20, strength=0.5)
+check("the bump at vertex 0 is smoothed toward its (fixed) neighbours' mean (~0,0,0)",
+      abs(smoothed[0][1]) < 0.05 and abs(smoothed[0][2]) < 0.05, str(smoothed[0]))
+check("neighbours acting as anchors are NEVER moved by the reference smoothing",
+      smoothed[1] == bumpy_ref[1] and smoothed[3] == bumpy_ref[3])
+check("zero iterations is a true no-op",
+      fcs._smooth_rest_reference(bumpy_ref, ref_nbrs, [0], iterations=0, strength=0.5)
+      == bumpy_ref)
 
 
 # =============================================================================
@@ -475,12 +578,16 @@ try:
     # the center cross as "interior" and excluding every face touching the
     # center from the intersection scan as boundary noise. The TRUE boundary
     # (the grid perimeter itself) is still fully protected either way.
+    # rest_reference_smoothing_iterations=0: isolate THIS regression test to the
+    # x_rest-source fix specifically (a separate test below covers rest-reference
+    # smoothing itself) -- with it enabled, x_rest != x at iteration 1 by design,
+    # which would make the "shape displacement ~= 0" assertion below meaningless.
     result_c2 = fcs.run_cleanup_solver(
         "grid_skin", ["floor"], target_offset=0.1, min_clearance=0.1,
         indices=[center_v], anatomy_backend=backend2, sdf_query=object(),
         cleanup_growth_rings=1, transition_rings=1, dynamic_active_set=False,
-        boundary_buffer_rings=0,
-        max_iterations=60, convergence_patience=3, apply=True, verbose=False,
+        boundary_buffer_rings=0, rest_reference_smoothing_iterations=0,
+        max_iterations=100, convergence_patience=3, apply=True, verbose=False,
         create_backup=False, save_json=False, save_csv=False)
 
     feas = result_c2["feasibility"]
@@ -520,7 +627,7 @@ try:
         "grid_skin", ["floor"], target_offset=0.3, min_clearance=0.1,
         indices=[center_v], anatomy_backend=backend2, sdf_query=object(),
         cleanup_growth_rings=1, transition_rings=1, dynamic_active_set=False,
-        max_iterations=30, convergence_patience=3, apply=True, verbose=False,
+        max_iterations=100, convergence_patience=3, apply=True, verbose=False,
         create_backup=False, save_json=False, save_csv=False)
     final_30 = [list(v) for v in store["verts"]]
 
@@ -529,7 +636,7 @@ try:
         "grid_skin", ["floor"], target_offset=0.3, min_clearance=0.1,
         indices=[center_v], anatomy_backend=backend2, sdf_query=object(),
         cleanup_growth_rings=1, transition_rings=1, dynamic_active_set=False,
-        max_iterations=80, convergence_patience=3, apply=True, verbose=False,
+        max_iterations=200, convergence_patience=3, apply=True, verbose=False,
         create_backup=False, save_json=False, save_csv=False)
     final_80 = [list(v) for v in store["verts"]]
 
