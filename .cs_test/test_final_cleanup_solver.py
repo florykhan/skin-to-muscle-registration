@@ -285,6 +285,29 @@ check("zero iterations is a true no-op",
       == bumpy_ref)
 
 
+print("\nA11. taubin_force: reproduces the lambda/mu math as a FORCE, not a "
+     "position replacement, via fairing_force reused twice")
+tf_pos = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]
+tf_nbrs = [[1, 2], [0], [0]]
+tf = fcs.taubin_force(tf_pos, tf_nbrs, [1], lamb=0.5, mu=-0.3, weight={1: 1.0})
+# hand-computed: lambda step moves vertex1 0.5 -> [0.5,0,0]; mu step (relative
+# to the now-fixed anchor at [0,0,0]) pushes back out to [0.65,0,0]; net = -0.35.
+approx("net Taubin displacement matches the hand-computed lambda-then-mu result",
+      tf[1][0], -0.35, tol=1e-9)
+check("input positions are never mutated", tf_pos[1] == [1.0, 0.0, 0.0])
+
+tf_zero = fcs.taubin_force(tf_pos, tf_nbrs, [1], lamb=0.5, mu=-0.3, weight={1: 0.0})
+check("zero weight -> zero net force (both half-steps see zero strength)",
+      tf_zero[1] == [0.0, 0.0, 0.0])
+
+# Anchors (vertex 0, not in `indices`) must stay FIXED across BOTH half-steps,
+# not drift between the lambda pass and the mu pass.
+tf3_pos = [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [-2.0, 0.0, 0.0]]
+tf3 = fcs.taubin_force(tf3_pos, tf_nbrs, [1, 2], lamb=0.4, mu=-0.4, weight={1: 1.0, 2: 1.0})
+check("symmetric setup gives symmetric (mirrored) net displacement for both moving verts",
+      abs(tf3[1][0] + tf3[2][0]) < 1e-9, str(tf3))
+
+
 # =============================================================================
 # PART B: repair integration point (resolve_skin_anatomy_intersections),
 # exercised directly and in isolation before trusting it inside the solver loop
@@ -651,6 +674,75 @@ try:
     check("more max_iterations headroom does not change the final geometry "
          "(does not keep shrinking/deforming once converged)",
          max_pos_diff < 1e-9, "max diff={0}".format(max_pos_diff))
+
+    print("\nD1. run_final_fairing: pure finishing pass -- Taubin, no M4, "
+         "reuses the caller's exact region, current mesh as reference")
+    store["verts"] = [list(p) for p in positions0]  # the spike-at-center scenario again
+    store["written"] = False
+    result_fair = fcs.run_final_fairing(
+        "grid_skin", ["floor"], indices=[center_v], anatomy_backend=backend2,
+        target_offset=0.3, min_clearance=0.1, transition_rings=1,
+        method="taubin", max_iterations=150, convergence_patience=3,
+        apply=True, verbose=False, create_backup=False, save_json=False, save_csv=False)
+
+    check("region_source is 'caller' -- the given indices were used directly, "
+         "not re-derived from a fresh M5 detection",
+         result_fair["region_source"] == "caller")
+    check("base region is exactly the given indices (1 vertex)",
+          result_fair["base_region_count"] == 1)
+    check("active_indices is exposed (not just a count)",
+          isinstance(result_fair.get("active_indices"), list) and len(result_fair["active_indices"]) >= 1)
+    check("NO M4 in this stage's result at all", "m4_disagreement" not in result_fair
+         and "m4_decay" not in result_fair)
+    check("converged", result_fair["converged"] is True, str(result_fair["stop_reason"]))
+    check("converged well before max_iterations (this toy single-vertex-core scenario needs "
+         "more steps than a real 16k-vertex run's 10-20 default; Taubin's mu-reversal deliberately "
+         "cancels part of each step, trading iteration count for shrinkage resistance)",
+          result_fair["iterations"] < 150, "iterations={0}".format(result_fair["iterations"]))
+    check("roughness improved (fairing region)",
+          result_fair["roughness"]["after"] < result_fair["roughness"]["before"],
+          str(result_fair["roughness"]))
+    check("no forbidden intersections at the end",
+          result_fair["intersections"]["after"]["pair_count"] == 0)
+    check("the spike vertex moved down toward its neighbours",
+          store["verts"][center_v][1] < 1.6, str(store["verts"][center_v]))
+    check("boundary vertices never moved during fairing either",
+          all(store["verts"][b] == positions0[b] for b in grid_boundary))
+    check("method reported correctly", result_fair["method"] == "taubin")
+
+    print("\nD2. run_final_fairing: laplacian method still available for A/B comparison")
+    store["verts"] = [list(p) for p in positions0]
+    result_fair_lap = fcs.run_final_fairing(
+        "grid_skin", ["floor"], indices=[center_v], anatomy_backend=backend2,
+        target_offset=0.3, min_clearance=0.1, transition_rings=1,
+        method="laplacian", fair_strength=0.3, max_iterations=60, convergence_patience=3,
+        apply=True, verbose=False, create_backup=False, save_json=False, save_csv=False)
+    check("laplacian method also converges safely", result_fair_lap["converged"] is True)
+    check("laplacian method also improves roughness",
+          result_fair_lap["roughness"]["after"] < result_fair_lap["roughness"]["before"])
+
+    print("\nD3. run_final_fairing: M5-fallback region path (indices=None) is wired "
+         "correctly -- M5 itself is mocked here since its own correctness is already "
+         "covered elsewhere; this only checks the fallback plumbing")
+    store["verts"] = [list(p) for p in positions0]
+    store["written"] = False
+    orig_detect = fcs.artifact_detection.detect_unified_artifacts
+    fcs.artifact_detection.detect_unified_artifacts = (
+        lambda *a, **k: ([center_v], {"final_indices": [center_v]}))
+    try:
+        result_fallback = fcs.run_final_fairing(
+            "grid_skin", ["floor"], indices=None, anatomy_backend=backend2,
+            target_offset=0.3, min_clearance=0.1, transition_rings=1,
+            max_iterations=5, convergence_patience=2,
+            apply=False, verbose=False, create_backup=False, save_json=False, save_csv=False)
+    finally:
+        fcs.artifact_detection.detect_unified_artifacts = orig_detect
+    check("no indices given -> falls back to (mocked) M5 detection",
+          result_fallback["region_source"] == "m5_fallback")
+    check("fallback region came from the (mocked) M5 call",
+          result_fallback["base_region_count"] == 1)
+    check("apply=False in the fallback path still does not write the mesh",
+          store["written"] is False)
 
 finally:
     ac.get_boundary_vertices = _orig.pop("ac_get_boundary_vertices")

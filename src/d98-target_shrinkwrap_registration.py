@@ -3951,6 +3951,70 @@ def print_final_cleanup_report(result):
     return final_cleanup_solver.print_final_cleanup_report(result)
 
 
+def run_final_skin_fairing(skin_mesh=None, indices=None, cleanup_result=None,
+                           max_iterations=20, apply=True,
+                           anatomical_meshes=None, min_clearance=None,
+                           target_offset=None, verbose=True, **kwargs):
+    """FINAL FAIRING: a pure finishing pass over the CURRENT mesh, after
+    ``run_final_skin_cleanup`` has already produced an anatomy-valid result.
+
+    Thin delegate to ``final_cleanup_solver.run_final_fairing``. Reads the
+    skin mesh EXACTLY as it currently stands in the scene (never restores the
+    original registered mesh, never re-runs M4) and fairs it with the SAME
+    per-vertex-safe machinery as the unified solver (no global alpha, real
+    triangle/triangle checking, local repair only where fairing actually
+    creates a conflict) -- just without M4 / M5-provenance forces, since that
+    work is already done.
+
+    ``indices``: pass ``cleanup_result["active_indices"]`` (or ``cleanup_result``
+    itself, from which this pulls it) from the JUST-COMPLETED
+    ``run_final_skin_cleanup`` call to reuse EXACTLY its broad active/fairing
+    region -- recommended, and the whole reason that result now exposes
+    ``active_indices``. Without either, the region falls back to a fresh M5
+    detection (same detector, but it will not carry that run's repair/growth
+    history) -- a convenience default, not the precise behaviour::
+
+        result = run_final_skin_cleanup(skin_mesh="skin_cloth_copy_v5_pull_back",
+                                        max_iterations=200, apply=True)
+        fair = run_final_skin_fairing(skin_mesh="skin_cloth_copy_v5_pull_back",
+                                      cleanup_result=result,
+                                      max_iterations=20, apply=True)
+        print_final_fairing_report(fair)
+
+    Default operator is Taubin (shrinkage-resistant); pass ``method="laplacian"``
+    for A/B comparison. Conservative default ``max_iterations=20`` per this
+    stage's intended use (a short finishing pass, not another long solve).
+    """
+    if not _helpers_ready():
+        return
+    if final_cleanup_solver is None:
+        print("[final_fairing] final_cleanup_solver helper not loaded; "
+              "re-send d98 to reload helpers.")
+        return
+    if not _configure_m4_sdf_backend():
+        return
+    skin_mesh = skin_mesh or SKIN_MESH
+    anatomical_meshes = anatomical_meshes or INTERNAL_MESHES
+    if indices is None and cleanup_result is not None:
+        indices = cleanup_result.get("active_indices")
+    backend, _sdf_fn = _make_anatomy_backend(anatomical_meshes)
+    if backend is None:
+        print("[final_fairing] no anatomy meshes found; cannot run. Check INTERNAL_MESHES.")
+        return
+    min_clearance = _default_min_clearance(min_clearance, target_offset)
+    return final_cleanup_solver.run_final_fairing(
+        skin_mesh, anatomical_meshes, indices=indices, min_clearance=min_clearance,
+        target_offset=target_offset, anatomy_backend=backend,
+        max_iterations=max_iterations, apply=apply, verbose=verbose, **kwargs)
+
+
+def print_final_fairing_report(result):
+    """Print the human-readable summary of a :func:`run_final_skin_fairing` result."""
+    if not _helpers_ready() or final_cleanup_solver is None or not result:
+        return
+    return final_cleanup_solver.print_final_fairing_report(result)
+
+
 def backup_skin_mesh(suffix="_precleanup"):
     """Duplicate the skin mesh as a backup before cleanup (name preserved)."""
     if not _helpers_ready():
@@ -4000,6 +4064,8 @@ if HELPERS_AVAILABLE:
     print("  run_m5_iterative_cleanup(target_offset=..)            - M5 CLOSED-LOOP detect->smooth->re-detect (legacy, unconstrained)")
     print("  run_final_skin_cleanup(max_iterations=200)            - FINAL unified fairing/anatomy-projection/repair solver (default path)")
     print("  print_final_cleanup_report(result)                    - pretty-print a run_final_skin_cleanup() result")
+    print("  run_final_skin_fairing(cleanup_result=result, max_iterations=20) - FINISHING pass: Taubin fairing only, M4 off, current mesh as reference")
+    print("  print_final_fairing_report(fair)                      - pretty-print a run_final_skin_fairing() result")
     print("  cleanup_selected_region(strength=0.3, iterations=8)   - smooth viewport selection")
     print("  cleanup_named_region('lips', strength=0.3)            - smooth heuristic region")
     print("  backup_skin_mesh()                                    - duplicate skin before edits")
