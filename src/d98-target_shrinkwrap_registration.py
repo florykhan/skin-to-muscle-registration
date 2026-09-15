@@ -76,11 +76,14 @@ HELPER_DEBUG = True
 
 # Order matters: modules that import siblings must come AFTER them.
 # artifact_detection imports mesh_utils + region_selection; smoothing_utils
-# imports anatomy_constraint; cleanup_pipeline imports artifact_detection +
-# smoothing_utils + metrics_utils + maya_io, so it is loaded last.
+# imports anatomy_constraint; cleanup_pipeline and final_cleanup_solver both
+# import artifact_detection + smoothing_utils/anatomy_constraint +
+# metrics_utils + maya_io, so they are loaded last (order between the two of
+# them does not matter -- neither imports the other).
 HELPER_MODULES = ("mesh_utils", "anatomy_constraint", "smoothing_utils",
                   "region_selection", "metrics_utils", "maya_io",
-                  "artifact_detection", "cleanup_pipeline")
+                  "artifact_detection", "cleanup_pipeline",
+                  "final_cleanup_solver")
 HELPERS_AVAILABLE = False
 
 # Placeholders so these names always exist (reassigned to real modules on load).
@@ -92,6 +95,7 @@ metrics_utils = None
 maya_io = None
 artifact_detection = None
 cleanup_pipeline = None
+final_cleanup_solver = None
 
 
 def _dir_has_helpers(d):
@@ -3880,6 +3884,73 @@ def run_m5_iterative_cleanup(target_offset=None, skin_mesh=None,
         m5_detector_kwargs=m5_detector_kwargs)
 
 
+def run_final_skin_cleanup(skin_mesh=None, max_iterations=200, apply=True,
+                           anatomical_meshes=None, target_offset=None,
+                           min_clearance=None, verbose=True, **kwargs):
+    """FINAL automated cleanup solver: detect -> fair/anatomy-project/repair ->
+    converge, in ONE call.
+
+    Thin delegate to ``final_cleanup_solver.run_cleanup_solver``. Fills in
+    everything a fresh Maya session has no way to already know -- the skin/
+    anatomy mesh names (``SKIN_MESH`` / ``INTERNAL_MESHES``), the registration's
+    own exact anatomy backend, and the hard anatomy floor
+    (``collision_min_distance``, via :func:`_default_min_clearance`, the SAME
+    value the registration's own collision system uses) -- so the normal
+    workflow really is just::
+
+        exec(d98...)
+        result = run_final_skin_cleanup(
+            skin_mesh="skin_cloth_copy_v5_pull_back",
+            max_iterations=200,
+            apply=True,
+        )
+        print_final_cleanup_report(result)
+
+    ``target_offset`` (M4's D0) is auto-picked from the scene's own distance
+    distribution when omitted (see
+    :func:`artifact_detection.summarize_skin_sdf_values`) -- you do not need to
+    call ``summarize_skin_anatomy_distances()`` first, though you still can to
+    sanity-check the value. Pass ``apply=False`` for a dry run (nothing in the
+    scene is modified). All other :func:`final_cleanup_solver.run_cleanup_solver`
+    keyword arguments (``cleanup_growth_rings``, ``transition_rings``,
+    ``w_fair``/``w_m4``/``w_shape``, ``convergence_patience``, ...) are
+    available as advanced/debug options via ``**kwargs``; the defaults are the
+    ones documented there.
+
+    This does NOT replace ``run_m5_iterative_cleanup`` (the earlier detect ->
+    unconstrained-smooth -> re-detect loop) or ``constrained_smooth_m5_region``
+    (the strict / repair_after_batch / off safety-mode smoother) -- both remain
+    available for reproducibility and A/B comparison; this is simply the
+    function to use for the FINAL, automated cleanup pass.
+    """
+    if not _helpers_ready():
+        return
+    if final_cleanup_solver is None:
+        print("[final_cleanup] final_cleanup_solver helper not loaded; "
+              "re-send d98 to reload helpers.")
+        return
+    if not _configure_m4_sdf_backend():
+        return
+    skin_mesh = skin_mesh or SKIN_MESH
+    anatomical_meshes = anatomical_meshes or INTERNAL_MESHES
+    backend, _sdf_fn = _make_anatomy_backend(anatomical_meshes)
+    if backend is None:
+        print("[final_cleanup] no anatomy meshes found; cannot run. Check INTERNAL_MESHES.")
+        return
+    min_clearance = _default_min_clearance(min_clearance, target_offset)
+    return final_cleanup_solver.run_cleanup_solver(
+        skin_mesh, anatomical_meshes, target_offset=target_offset,
+        min_clearance=min_clearance, anatomy_backend=backend,
+        max_iterations=max_iterations, apply=apply, verbose=verbose, **kwargs)
+
+
+def print_final_cleanup_report(result):
+    """Print the human-readable summary of a :func:`run_final_skin_cleanup` result."""
+    if not _helpers_ready() or final_cleanup_solver is None or not result:
+        return
+    return final_cleanup_solver.print_final_cleanup_report(result)
+
+
 def backup_skin_mesh(suffix="_precleanup"):
     """Duplicate the skin mesh as a backup before cleanup (name preserved)."""
     if not _helpers_ready():
@@ -3926,7 +3997,9 @@ if HELPERS_AVAILABLE:
     print("  resolve_m5_region_penetrations(fixed_region)          - pre-repair penetrations only")
     print("  debug_skin_anatomy_vertex(i)                          - diagnose one skin vertex")
     print("  restore_skin_from_backup(CUR+'_preconstrainedsmooth') - copy verts from a backup mesh")
-    print("  run_m5_iterative_cleanup(target_offset=..)            - M5 CLOSED-LOOP detect->smooth->re-detect")
+    print("  run_m5_iterative_cleanup(target_offset=..)            - M5 CLOSED-LOOP detect->smooth->re-detect (legacy, unconstrained)")
+    print("  run_final_skin_cleanup(max_iterations=200)            - FINAL unified fairing/anatomy-projection/repair solver (default path)")
+    print("  print_final_cleanup_report(result)                    - pretty-print a run_final_skin_cleanup() result")
     print("  cleanup_selected_region(strength=0.3, iterations=8)   - smooth viewport selection")
     print("  cleanup_named_region('lips', strength=0.3)            - smooth heuristic region")
     print("  backup_skin_mesh()                                    - duplicate skin before edits")
