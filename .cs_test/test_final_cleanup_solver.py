@@ -172,6 +172,55 @@ for _ in range(5):
 check("old offender ages out of the rolling window", osc == set(), str(osc))
 
 
+print("\nA6b. roughness-targeted fairing weights")
+flat_scores = [0.04] * 20 + [0.05] * 20
+flat_sorted = sorted(flat_scores)
+rk, wk = fcs._roughness_weight_knots(flat_sorted, 75.0, 0.75, 2.0)
+# almost-no-variation knots collapse; mapping should stay near 1
+w_flat = fcs.roughness_to_fairing_weight(0.045, rk, wk)
+check("near-uniform roughness stays at or below 1.0 (not jumped to max)",
+      0.75 - 1e-6 <= w_flat <= 1.0 + 1e-6, str(w_flat))
+
+# synthetic heavy tail matching the reported diagnostic shape
+synth = [0.04] * 50 + [0.05] * 25 + [0.16] * 10 + [0.26] * 5 + [0.91] * 4 + [4.5]
+synth = sorted(synth)
+rk, wk = fcs._roughness_weight_knots(synth, 75.0, 0.75, 2.0)
+approx("p75 knot weight is 1.0", wk[1] if len(wk) > 1 else wk[0], 1.0)
+approx("max knot weight is 2.0", wk[-1], 2.0)
+w_smooth = fcs.roughness_to_fairing_weight(synth[0], rk, wk)
+w_p90 = fcs.roughness_to_fairing_weight(fcs._percentile(synth, 90.0), rk, wk)
+w_p99 = fcs.roughness_to_fairing_weight(fcs._percentile(synth, 99.0), rk, wk)
+w_max = fcs.roughness_to_fairing_weight(synth[-1], rk, wk)
+check("already-smooth skin is not boosted", w_smooth <= 1.0 + 1e-6, str(w_smooth))
+check("p90 is boosted above 1", w_p90 > 1.0, str(w_p90))
+check("p99 is boosted more than p90", w_p99 > w_p90, "{0} vs {1}".format(w_p99, w_p90))
+approx("max roughness maps to weight_max", w_max, 2.0)
+
+# path 0-1-2-3-4-5-6-7-8 with a geometric spike at 4
+spike_pos = [[float(i), (1.5 if i == 4 else 0.0), 0.0] for i in range(9)]
+w_field, info = fcs.build_roughness_fairing_weights(
+    spike_pos, path_neighbors, list(range(9)),
+    percentile_start=75.0, weight_min=0.75, weight_max=2.0, smoothing_rings=3)
+check("spike vertex is among the boosted set",
+      info["boosted_count"] >= 1 and w_field[4] > w_field[0],
+      "w4={0} w0={1} boosted={2}".format(w_field[4], w_field[0], info["boosted_count"]))
+check("falloff is spatially smooth (neighbour of spike is between spike and far verts)",
+      w_field[8] <= w_field[5] <= w_field[4] + 1e-9,
+      "w8={0} w5={1} w4={2}".format(w_field[8], w_field[5], w_field[4]))
+damped = w_field[4] * fcs.DEFAULT_OSCILLATION_DAMPING
+check("oscillation damping multiplies the roughness weight (does not reset to 1.0*damp)",
+      abs(damped - 1.0 * fcs.DEFAULT_OSCILLATION_DAMPING) > 1e-6
+      or w_field[4] <= 1.0 + 1e-6,
+      "base={0} damped={1}".format(w_field[4], damped))
+check("weight stats present",
+      info["min"] <= info["mean"] <= info["max"] and info["boosted_count"] >= 0)
+
+pct = fcs.roughness_percentile_summary(
+    list(fcs.laplacian_magnitudes(spike_pos, path_neighbors, list(range(9))).values()))
+check("percentile summary has p50/p90/p95/p99/max",
+      all(k in pct for k in ("p50", "p90", "p95", "p99", "max")))
+
+
 print("\nA7. persistent, monotonic M4 decay -- the actual reported-bug regression test")
 # decay_m4_weight is now a pure ONE-STEP ratchet: caller owns the persistent state.
 approx("ratchet step: one decay", fcs.decay_m4_weight(1.0, decay_rate=0.5, floor=0.0), 0.5)
@@ -743,6 +792,39 @@ try:
           result_fallback["base_region_count"] == 1)
     check("apply=False in the fallback path still does not write the mesh",
           store["written"] is False)
+
+    print("\nD4. run_final_fairing reports roughness-targeted weights + percentiles")
+    store["verts"] = [list(p) for p in positions0]
+    result_w = fcs.run_final_fairing(
+        "grid_skin", ["floor"], indices=[center_v], anatomy_backend=backend2,
+        target_offset=0.3, min_clearance=0.1, transition_rings=1,
+        method="taubin", max_iterations=5, convergence_patience=8,
+        roughness_weighting=True, roughness_weight_max=2.0,
+        roughness_weight_percentile_start=75, roughness_weight_smoothing_rings=3,
+        apply=False, verbose=False, create_backup=False, save_json=False, save_csv=False)
+    check("percentiles_before present",
+          all(k in (result_w["roughness"].get("percentiles_before") or {})
+              for k in ("p50", "p90", "p95", "p99", "max")))
+    check("percentiles_after present",
+          all(k in (result_w["roughness"].get("percentiles_after") or {})
+              for k in ("p50", "p90", "p95", "p99", "max")))
+    fw = result_w.get("fairing_weight") or {}
+    check("fairing_weight stats present",
+          all(k in fw for k in ("min", "mean", "max", "boosted_count")))
+    check("roughness_weighting enabled in report", fw.get("enabled") is True)
+    result_off = fcs.run_final_fairing(
+        "grid_skin", ["floor"], indices=[center_v], anatomy_backend=backend2,
+        target_offset=0.3, min_clearance=0.1, transition_rings=1,
+        method="taubin", max_iterations=2, convergence_patience=8,
+        roughness_weighting=False,
+        apply=False, verbose=False, create_backup=False, save_json=False, save_csv=False)
+    check("roughness_weighting=False keeps uniform weight 1.0",
+          abs(result_off["fairing_weight"]["min"] - 1.0) < 1e-12
+          and abs(result_off["fairing_weight"]["max"] - 1.0) < 1e-12
+          and result_off["fairing_weight"]["boosted_count"] == 0,
+          str(result_off.get("fairing_weight")))
+    check("uniform path is marked disabled",
+          result_off["fairing_weight"]["enabled"] is False)
 
 finally:
     ac.get_boundary_vertices = _orig.pop("ac_get_boundary_vertices")

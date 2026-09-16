@@ -3954,7 +3954,12 @@ def print_final_cleanup_report(result):
 def run_final_skin_fairing(skin_mesh=None, indices=None, cleanup_result=None,
                            max_iterations=20, apply=True,
                            anatomical_meshes=None, min_clearance=None,
-                           target_offset=None, verbose=True, **kwargs):
+                           target_offset=None, verbose=True,
+                           roughness_weighting=True,
+                           roughness_weight_max=2.0,
+                           roughness_weight_percentile_start=75,
+                           roughness_weight_smoothing_rings=3,
+                           **kwargs):
     """FINAL FAIRING: a pure finishing pass over the CURRENT mesh, after
     ``run_final_skin_cleanup`` has already produced an anatomy-valid result.
 
@@ -3984,6 +3989,10 @@ def run_final_skin_fairing(skin_mesh=None, indices=None, cleanup_result=None,
     Default operator is Taubin (shrinkage-resistant); pass ``method="laplacian"``
     for A/B comparison. Conservative default ``max_iterations=20`` per this
     stage's intended use (a short finishing pass, not another long solve).
+    Remaining ridges are emphasised via ``roughness_weighting`` (default True):
+    local Laplacian magnitude maps onto a mild [0.75, 2.0] fairing weight with
+    a 3-ring topological falloff. Pass ``roughness_weighting=False`` for the
+    old uniform-weight fairing.
     """
     if not _helpers_ready():
         return
@@ -4005,7 +4014,12 @@ def run_final_skin_fairing(skin_mesh=None, indices=None, cleanup_result=None,
     return final_cleanup_solver.run_final_fairing(
         skin_mesh, anatomical_meshes, indices=indices, min_clearance=min_clearance,
         target_offset=target_offset, anatomy_backend=backend,
-        max_iterations=max_iterations, apply=apply, verbose=verbose, **kwargs)
+        max_iterations=max_iterations, apply=apply, verbose=verbose,
+        roughness_weighting=roughness_weighting,
+        roughness_weight_max=roughness_weight_max,
+        roughness_weight_percentile_start=roughness_weight_percentile_start,
+        roughness_weight_smoothing_rings=roughness_weight_smoothing_rings,
+        **kwargs)
 
 
 def print_final_fairing_report(result):
@@ -4064,7 +4078,7 @@ if HELPERS_AVAILABLE:
     print("  run_m5_iterative_cleanup(target_offset=..)            - M5 CLOSED-LOOP detect->smooth->re-detect (legacy, unconstrained)")
     print("  run_final_skin_cleanup(max_iterations=200)            - FINAL unified fairing/anatomy-projection/repair solver (default path)")
     print("  print_final_cleanup_report(result)                    - pretty-print a run_final_skin_cleanup() result")
-    print("  run_final_skin_fairing(cleanup_result=result, max_iterations=20) - FINISHING pass: Taubin fairing only, M4 off, current mesh as reference")
+    print("  run_final_skin_fairing(cleanup_result=result, max_iterations=20) - FINISHING pass: Taubin + roughness-targeted weights")
     print("  print_final_fairing_report(fair)                      - pretty-print a run_final_skin_fairing() result")
     print("  cleanup_selected_region(strength=0.3, iterations=8)   - smooth viewport selection")
     print("  cleanup_named_region('lips', strength=0.3)            - smooth heuristic region")

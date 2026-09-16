@@ -193,6 +193,18 @@ DEFAULT_OSCILLATION_WINDOW = 5
 DEFAULT_OSCILLATION_REPEAT_THRESHOLD = 3
 DEFAULT_OSCILLATION_DAMPING = 0.2
 
+# --- roughness-targeted fairing weights (run_final_fairing only) --------------
+# Uniform weight 1.0 was spreading fairing onto already-smooth skin (p50 got
+# worse) while the remaining ridges (p90/p95/p99) barely moved. Map local
+# Laplacian magnitude onto a mild [0.75, 2.0] weight, then diffuse it over a
+# few one-rings so a ridge is a coherent patch, not an isolated spike.
+DEFAULT_ROUGHNESS_WEIGHTING = True
+DEFAULT_ROUGHNESS_WEIGHT_MIN = 0.75
+DEFAULT_ROUGHNESS_WEIGHT_MAX = 2.0
+DEFAULT_ROUGHNESS_WEIGHT_PERCENTILE_START = 75.0
+DEFAULT_ROUGHNESS_WEIGHT_SMOOTHING_RINGS = 3
+_ROUGHNESS_WEIGHT_UPPER_PERCENTILES = (90.0, 95.0, 99.0)
+
 PHASE_ANATOMY_CORRECTION = "anatomy_correction"
 PHASE_BALANCED_CLEANUP = "balanced_cleanup"
 PHASE_FAIRING_FINISH = "fairing_finish"
@@ -715,6 +727,25 @@ def apply_step(positions: List[List[float]],
     return out
 
 
+def laplacian_magnitudes(positions: List[List[float]],
+                         neighbors: List[List[int]],
+                         indices: Sequence[int],
+                         ) -> Dict[int, float]:
+    """Per-vertex umbrella-Laplacian magnitude -- the SAME formula as
+    :func:`mean_laplacian_magnitude` / M1's ``compute_laplacian_scores``,
+    evaluated on an in-memory position array. Vertices with no neighbours
+    are omitted (they have no local fairness signal).
+    """
+    out: Dict[int, float] = {}
+    for i in indices:
+        nbrs = neighbors[i] if 0 <= i < len(neighbors) else []
+        if not nbrs:
+            continue
+        avg = mesh_utils.vec_mean([positions[j] for j in nbrs])
+        out[i] = mesh_utils.vec_length(mesh_utils.vec_sub(positions[i], avg))
+    return out
+
+
 def mean_laplacian_magnitude(positions: List[List[float]],
                              neighbors: List[List[int]],
                              indices: Sequence[int],
@@ -723,21 +754,200 @@ def mean_laplacian_magnitude(positions: List[List[float]],
     as :func:`artifact_detection.compute_laplacian_scores` (M1), evaluated on
     an in-memory position array instead of a live mesh.
 
-    This is a deliberate, minimal (4-line) re-expression, not a duplicated
-    detector: the solver holds state in-memory across many iterations and must
-    not round-trip every one of them through Maya just to measure roughness,
-    so it cannot call the Maya-backed M1 function directly here.
+    This is a deliberate, minimal re-expression, not a duplicated detector:
+    the solver holds state in-memory across many iterations and must not
+    round-trip every one of them through Maya just to measure roughness, so
+    it cannot call the Maya-backed M1 function directly here.
     """
-    if not indices:
-        return 0.0
-    vals = []
-    for i in indices:
-        nbrs = neighbors[i] if 0 <= i < len(neighbors) else []
-        if not nbrs:
-            continue
-        avg = mesh_utils.vec_mean([positions[j] for j in nbrs])
-        vals.append(mesh_utils.vec_length(mesh_utils.vec_sub(positions[i], avg)))
+    vals = list(laplacian_magnitudes(positions, neighbors, indices).values())
     return (sum(vals) / len(vals)) if vals else 0.0
+
+
+def _percentile(sorted_vals: Sequence[float], pct: float) -> float:
+    """Linear-interpolation percentile of an already-sorted ascending list."""
+    if not sorted_vals:
+        return 0.0
+    if pct <= 0:
+        return float(sorted_vals[0])
+    if pct >= 100:
+        return float(sorted_vals[-1])
+    k = (len(sorted_vals) - 1) * (float(pct) / 100.0)
+    lo = int(math.floor(k))
+    hi = int(math.ceil(k))
+    if lo == hi:
+        return float(sorted_vals[int(k)])
+    return float(sorted_vals[lo]) + (float(sorted_vals[hi]) - float(sorted_vals[lo])) * (k - lo)
+
+
+def roughness_percentile_summary(values: Sequence[float]) -> Dict[str, float]:
+    """p50 / p90 / p95 / p99 / max of a Laplacian-magnitude sample."""
+    vals = [float(v) for v in values]
+    if not vals:
+        return {"p50": 0.0, "p90": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0, "mean": 0.0}
+    s = sorted(vals)
+    return {
+        "mean": sum(s) / len(s),
+        "p50": _percentile(s, 50.0),
+        "p90": _percentile(s, 90.0),
+        "p95": _percentile(s, 95.0),
+        "p99": _percentile(s, 99.0),
+        "max": s[-1],
+    }
+
+
+def _piecewise_lerp(x: float, xs: Sequence[float], ys: Sequence[float]) -> float:
+    if not xs:
+        return 1.0
+    if x <= xs[0]:
+        return float(ys[0])
+    if x >= xs[-1]:
+        return float(ys[-1])
+    for i in range(1, len(xs)):
+        if x <= xs[i]:
+            span = xs[i] - xs[i - 1]
+            t = 0.0 if span <= 1e-15 else (x - xs[i - 1]) / span
+            return float(ys[i - 1]) + t * (float(ys[i]) - float(ys[i - 1]))
+    return float(ys[-1])
+
+
+def _roughness_weight_knots(sorted_vals: Sequence[float],
+                            percentile_start: float,
+                            weight_min: float,
+                            weight_max: float,
+                            ) -> Tuple[List[float], List[float]]:
+    """Roughness-value knots and matching fairing-weight knots.
+
+    Continuous map (defaults ``weight_min=0.75``, ``weight_max=2.0``,
+    ``percentile_start=75``)::
+
+        min .. p75   ->  0.75 .. 1.00   (already-smooth skin: slightly less)
+        p75  .. p90  ->  1.00 .. 1.25
+        p90  .. p95  ->  1.25 .. 1.50
+        p95  .. p99  ->  1.50 .. 1.75
+        p99  .. max  ->  1.75 .. 2.00
+    """
+    if not sorted_vals:
+        return [0.0], [1.0]
+    if float(sorted_vals[-1]) - float(sorted_vals[0]) <= 1e-12:
+        return [float(sorted_vals[0])], [1.0]
+    w_min = float(weight_min)
+    w_max = max(1.0, float(weight_max))
+    span = w_max - 1.0
+    r_knots = [
+        float(sorted_vals[0]),
+        _percentile(sorted_vals, float(percentile_start)),
+        _percentile(sorted_vals, _ROUGHNESS_WEIGHT_UPPER_PERCENTILES[0]),
+        _percentile(sorted_vals, _ROUGHNESS_WEIGHT_UPPER_PERCENTILES[1]),
+        _percentile(sorted_vals, _ROUGHNESS_WEIGHT_UPPER_PERCENTILES[2]),
+        float(sorted_vals[-1]),
+    ]
+    w_knots = [
+        w_min,
+        1.0,
+        1.0 + 0.25 * span,
+        1.0 + 0.50 * span,
+        1.0 + 0.75 * span,
+        w_max,
+    ]
+    xs: List[float] = [r_knots[0]]
+    ys: List[float] = [w_knots[0]]
+    for r, w in zip(r_knots[1:], w_knots[1:]):
+        if r > xs[-1] + 1e-15:
+            xs.append(r)
+            ys.append(w)
+        # Duplicate roughness knot: keep the earlier (lower) weight so a
+        # collapsed tail cannot jump straight to weight_max.
+    return xs, ys
+
+
+def roughness_to_fairing_weight(magnitude: float,
+                                r_knots: Sequence[float],
+                                w_knots: Sequence[float],
+                                ) -> float:
+    return _piecewise_lerp(float(magnitude), r_knots, w_knots)
+
+
+def _smooth_weight_field(weights: Dict[int, float],
+                         neighbors: List[List[int]],
+                         rings: int,
+                         ) -> Dict[int, float]:
+    """One-ring Jacobi averages of a scalar weight field (``rings`` passes).
+
+    Restricted to ``weights`` keys, so the field cannot leak onto frozen
+    exterior vertices. Including self in the average keeps an isolated peak
+    from collapsing in one step while still spreading it to its 1-ring.
+    """
+    w = {i: float(v) for i, v in weights.items()}
+    allowed = set(w.keys())
+    n_pass = max(0, int(rings))
+    for _ in range(n_pass):
+        nxt = {}
+        for i, wi in w.items():
+            nbrs = [j for j in (neighbors[i] if 0 <= i < len(neighbors) else [])
+                    if j in allowed]
+            if not nbrs:
+                nxt[i] = wi
+                continue
+            nxt[i] = (wi + sum(w[j] for j in nbrs)) / float(1 + len(nbrs))
+        w = nxt
+    return w
+
+
+def build_roughness_fairing_weights(positions: List[List[float]],
+                                    neighbors: List[List[int]],
+                                    indices: Sequence[int],
+                                    percentile_start: float = DEFAULT_ROUGHNESS_WEIGHT_PERCENTILE_START,
+                                    weight_min: float = DEFAULT_ROUGHNESS_WEIGHT_MIN,
+                                    weight_max: float = DEFAULT_ROUGHNESS_WEIGHT_MAX,
+                                    smoothing_rings: int = DEFAULT_ROUGHNESS_WEIGHT_SMOOTHING_RINGS,
+                                    ) -> Tuple[Dict[int, float], Dict[str, Any]]:
+    """Map local Laplacian roughness onto a spatially-smooth fairing weight.
+
+    Returns ``(weights, info)`` where ``info`` holds the frozen roughness
+    knots (so later-grown vertices can be mapped the same way) and the
+    pre-damping weight statistics.
+    """
+    idx = list(indices)
+    scores = laplacian_magnitudes(positions, neighbors, idx)
+    vals = sorted(scores.values())
+    if len(vals) < 2 or (vals[-1] - vals[0]) <= 1e-12:
+        weights = {i: 1.0 for i in idx}
+        info = {
+            "r_knots": [vals[0] if vals else 0.0],
+            "w_knots": [1.0],
+            "uniform": True,
+            "min": 1.0, "mean": 1.0, "max": 1.0,
+            "boosted_count": 0,
+        }
+        return weights, info
+    r_knots, w_knots = _roughness_weight_knots(
+        vals, percentile_start, weight_min, weight_max)
+    raw = {}
+    for i in idx:
+        mag = scores.get(i)
+        raw[i] = 1.0 if mag is None else roughness_to_fairing_weight(mag, r_knots, w_knots)
+    weights = _smooth_weight_field(raw, neighbors, smoothing_rings)
+    lo = float(min(weight_min, 1.0))
+    hi = float(max(weight_max, 1.0))
+    for i in list(weights.keys()):
+        if weights[i] < lo:
+            weights[i] = lo
+        elif weights[i] > hi:
+            weights[i] = hi
+    wvals = list(weights.values())
+    boosted = sum(1 for v in wvals if v > 1.0 + 1e-6)
+    info = {
+        "r_knots": list(r_knots),
+        "w_knots": list(w_knots),
+        "uniform": False,
+        "min": min(wvals) if wvals else 1.0,
+        "mean": (sum(wvals) / len(wvals)) if wvals else 1.0,
+        "max": max(wvals) if wvals else 1.0,
+        "boosted_count": boosted,
+        "smoothing_rings": int(smoothing_rings),
+        "percentile_start": float(percentile_start),
+    }
+    return weights, info
 
 
 def mean_target_disagreement(positions: List[List[float]],
@@ -2323,6 +2533,12 @@ def run_final_fairing(skin_mesh: str,
                       oscillation_window: int = DEFAULT_OSCILLATION_WINDOW,
                       oscillation_repeat_threshold: int = DEFAULT_OSCILLATION_REPEAT_THRESHOLD,
                       oscillation_damping: float = DEFAULT_OSCILLATION_DAMPING,
+                      # --- roughness-targeted fairing weights ------------------
+                      roughness_weighting: bool = DEFAULT_ROUGHNESS_WEIGHTING,
+                      roughness_weight_min: float = DEFAULT_ROUGHNESS_WEIGHT_MIN,
+                      roughness_weight_max: float = DEFAULT_ROUGHNESS_WEIGHT_MAX,
+                      roughness_weight_percentile_start: float = DEFAULT_ROUGHNESS_WEIGHT_PERCENTILE_START,
+                      roughness_weight_smoothing_rings: int = DEFAULT_ROUGHNESS_WEIGHT_SMOOTHING_RINGS,
                       # --- best-feasible-state tracking -----------------------
                       track_best_state: bool = True,
                       # --- iteration / convergence --------------------------
@@ -2390,11 +2606,14 @@ def run_final_fairing(skin_mesh: str,
         form without also preserving any texture still present in the current
         state.
 
-    This stage deliberately has NO M4 term, NO M5-provenance-based weighting
-    (every active vertex gets the same base fairing weight, damped only by
-    oscillation detection), and NO redetection. Per-vertex trust region, real
-    triangle/triangle checking, and LOCAL repair (never a global alpha) are
-    unchanged from the rest of this module -- see :func:`combine_step`,
+    This stage deliberately has NO M4 term, NO M5-provenance-based weighting,
+    and NO redetection. Base fairing weights default to a roughness-targeted
+    field (:func:`build_roughness_fairing_weights`) so remaining ridges get
+    more emphasis than already-smooth skin; pass ``roughness_weighting=False``
+    to restore the old uniform 1.0. Oscillation detection still multiplies
+    those base weights in place (it never overwrites the targeting).
+    Per-vertex trust region, real triangle/triangle checking, and LOCAL
+    repair (never a global alpha) are unchanged -- see :func:`combine_step`,
     :func:`_scoped_intersection_core`, :func:`_repair_local`.
 
     Returns
@@ -2534,12 +2753,46 @@ def run_final_fairing(skin_mesh: str,
 
     roughness_start = mean_laplacian_magnitude(x, neighbors, sorted(fairing_region))
     core_roughness_start = mean_laplacian_magnitude(x, neighbors, base_region)
+    roughness_pct_before = roughness_percentile_summary(
+        list(laplacian_magnitudes(x, neighbors, sorted(fairing_region)).values()))
     min_dist0 = min((anatomy_backend.exact_closest(x[i])["distance"] for i in sorted(active)),
                     default=float("inf"))
 
-    # Uniform base weight per vertex (NO M5 provenance distinction here); only
-    # ever damped in place by oscillation detection.
-    weights: Dict[int, float] = {i: 1.0 for i in active}
+    # Base fairing weight per vertex. Oscillation detection only ever MULTIPLIES
+    # these in place -- it must not overwrite roughness targeting with 1.0.
+    weight_knots: Optional[Dict[str, Any]] = None
+    if roughness_weighting and active:
+        weights, weight_info = build_roughness_fairing_weights(
+            x, neighbors, sorted(active),
+            percentile_start=roughness_weight_percentile_start,
+            weight_min=roughness_weight_min,
+            weight_max=roughness_weight_max,
+            smoothing_rings=roughness_weight_smoothing_rings)
+        weight_knots = weight_info
+        if verbose:
+            print("[final_fairing] roughness-targeted weights: min={0:.3f} mean={1:.3f} "
+                  "max={2:.3f} boosted={3}/{4} (>{5:g}th pct, max={6:g}, smooth={7} rings)"
+                  .format(weight_info["min"], weight_info["mean"], weight_info["max"],
+                          weight_info["boosted_count"], len(weights),
+                          roughness_weight_percentile_start, roughness_weight_max,
+                          roughness_weight_smoothing_rings))
+    else:
+        weights = {i: 1.0 for i in active}
+        wvals = list(weights.values())
+        weight_info = {
+            "uniform": True,
+            "min": min(wvals) if wvals else 1.0,
+            "mean": (sum(wvals) / len(wvals)) if wvals else 1.0,
+            "max": max(wvals) if wvals else 1.0,
+            "boosted_count": 0,
+        }
+    base_weight_stats = {
+        "min": weight_info["min"],
+        "mean": weight_info["mean"],
+        "max": weight_info["max"],
+        "boosted_count": weight_info["boosted_count"],
+        "enabled": bool(roughness_weighting),
+    }
 
     iterations_log: List[Dict[str, Any]] = []
     csv_rows: List[Dict[str, Any]] = []
@@ -2636,9 +2889,20 @@ def run_final_fairing(skin_mesh: str,
             active = set(region["active"])
             anchor = region["anchor"]
             for j in grown_by_repair:
-                weights.setdefault(j, 1.0)
+                if j not in weights:
+                    mag = laplacian_magnitudes(x, neighbors, [j]).get(j)
+                    if mag is not None and weight_knots and not weight_knots.get("uniform"):
+                        weights[j] = roughness_to_fairing_weight(
+                            mag, weight_knots["r_knots"], weight_knots["w_knots"])
+                    else:
+                        weights[j] = 1.0
             for j in active - set(weights.keys()):
-                weights.setdefault(j, 0.5)
+                mag = laplacian_magnitudes(x, neighbors, [j]).get(j)
+                if mag is not None and weight_knots and not weight_knots.get("uniform"):
+                    weights.setdefault(j, roughness_to_fairing_weight(
+                        mag, weight_knots["r_knots"], weight_knots["w_knots"]))
+                else:
+                    weights.setdefault(j, 0.5)
             new_active = sorted(active - set(floors.keys()))
             if new_active:
                 new_floors, _od2, _pu2 = anatomy_constraint.compute_clearance_floors(
@@ -2776,6 +3040,8 @@ def run_final_fairing(skin_mesh: str,
 
     final_roughness = mean_laplacian_magnitude(x, neighbors, sorted(fairing_region))
     final_core_roughness = mean_laplacian_magnitude(x, neighbors, base_region)
+    roughness_pct_after = roughness_percentile_summary(
+        list(laplacian_magnitudes(x, neighbors, sorted(fairing_region)).values()))
     total_disp = metrics_utils.displacement_stats(positions0, x, indices=sorted(set(base_region) | active))
     whole_disp = metrics_utils.displacement_stats(positions0, x)
 
@@ -2824,7 +3090,10 @@ def run_final_fairing(skin_mesh: str,
                      "pair_count": whole_report.get("intersection_pair_count", 0)},
         },
         "roughness": {"before": roughness_start, "after": final_roughness,
-                     "core_before": core_roughness_start, "core_after": final_core_roughness},
+                     "core_before": core_roughness_start, "core_after": final_core_roughness,
+                     "percentiles_before": roughness_pct_before,
+                     "percentiles_after": roughness_pct_after},
+        "fairing_weight": dict(base_weight_stats),
         "min_exact_anatomy_distance": {"before": min_dist0,
                                       "after": min((anatomy_backend.exact_closest(x[i])["distance"]
                                                   for i in final_active), default=float("inf"))},
@@ -2848,6 +3117,11 @@ def run_final_fairing(skin_mesh: str,
             "oscillation_repeat_threshold": oscillation_repeat_threshold,
             "track_best_state": track_best_state,
             "max_iterations": max_iterations, "convergence_patience": convergence_patience,
+            "roughness_weighting": bool(roughness_weighting),
+            "roughness_weight_min": roughness_weight_min,
+            "roughness_weight_max": roughness_weight_max,
+            "roughness_weight_percentile_start": roughness_weight_percentile_start,
+            "roughness_weight_smoothing_rings": roughness_weight_smoothing_rings,
         },
     }
 
@@ -2899,6 +3173,21 @@ def print_final_fairing_report(result: Dict[str, Any]) -> None:
         rough.get("before", 0.0), rough.get("after", 0.0)))
     print("roughness (core region):    {0:.5f} -> {1:.5f}".format(
         rough.get("core_before", 0.0), rough.get("core_after", 0.0)))
+    pb = rough.get("percentiles_before") or {}
+    pa = rough.get("percentiles_after") or {}
+    if pb or pa:
+        print("roughness percentiles:")
+        print("  before  p50={0:.5f}  p90={1:.5f}  p95={2:.5f}  p99={3:.5f}  max={4:.5f}".format(
+            pb.get("p50", 0.0), pb.get("p90", 0.0), pb.get("p95", 0.0),
+            pb.get("p99", 0.0), pb.get("max", 0.0)))
+        print("  after   p50={0:.5f}  p90={1:.5f}  p95={2:.5f}  p99={3:.5f}  max={4:.5f}".format(
+            pa.get("p50", 0.0), pa.get("p90", 0.0), pa.get("p95", 0.0),
+            pa.get("p99", 0.0), pa.get("max", 0.0)))
+    fw = result.get("fairing_weight") or {}
+    print("base fairing weight: min={0:.3f} mean={1:.3f} max={2:.3f}  "
+          "boosted={3}  (roughness_weighting={4})".format(
+              fw.get("min", 1.0), fw.get("mean", 1.0), fw.get("max", 1.0),
+              fw.get("boosted_count", 0), fw.get("enabled", False)))
     dist = result.get("min_exact_anatomy_distance") or {}
     print("min exact anatomy distance: {0:.4f} -> {1:.4f}".format(
         dist.get("before", float("inf")), dist.get("after", float("inf"))))
