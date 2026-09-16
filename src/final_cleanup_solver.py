@@ -3045,6 +3045,27 @@ def run_final_fairing(skin_mesh: str,
     total_disp = metrics_utils.displacement_stats(positions0, x, indices=sorted(set(base_region) | active))
     whole_disp = metrics_utils.displacement_stats(positions0, x)
 
+    # Is smoothing itself weak, or is anatomy constraint absorbing most of the
+    # proposed motion? Aggregated from the SAME per-iteration numbers already
+    # in iterations_log (nothing new computed here) so this is a pure summary,
+    # not a new measurement.
+    _proposal_means = [r["raw_proposal_displacement"]["mean"] for r in iterations_log]
+    _net_means = [r["net_displacement"]["mean"] for r in iterations_log]
+    _clr_counts = [r["clearance_displacement"]["count"] for r in iterations_log]
+    _clr_means = [r["clearance_displacement"]["mean"] for r in iterations_log
+                 if r["clearance_displacement"]["count"]]
+    anatomy_constraint_summary = {
+        "mean_raw_proposal_displacement": (
+            sum(_proposal_means) / len(_proposal_means)) if _proposal_means else 0.0,
+        "mean_net_accepted_displacement": (
+            sum(_net_means) / len(_net_means)) if _net_means else 0.0,
+        "mean_vertices_clearance_constrained_per_iteration": (
+            sum(_clr_counts) / len(_clr_counts)) if _clr_counts else 0.0,
+        "total_clearance_constraint_events": sum(_clr_counts),
+        "mean_clearance_correction_when_applied": (
+            sum(_clr_means) / len(_clr_means)) if _clr_means else 0.0,
+    }
+
     unresolved = None
     if not converged:
         unresolved = {
@@ -3094,6 +3115,7 @@ def run_final_fairing(skin_mesh: str,
                      "percentiles_before": roughness_pct_before,
                      "percentiles_after": roughness_pct_after},
         "fairing_weight": dict(base_weight_stats),
+        "anatomy_constraint_summary": anatomy_constraint_summary,
         "min_exact_anatomy_distance": {"before": min_dist0,
                                       "after": min((anatomy_backend.exact_closest(x[i])["distance"]
                                                   for i in final_active), default=float("inf"))},
@@ -3188,6 +3210,19 @@ def print_final_fairing_report(result: Dict[str, Any]) -> None:
           "boosted={3}  (roughness_weighting={4})".format(
               fw.get("min", 1.0), fw.get("mean", 1.0), fw.get("max", 1.0),
               fw.get("boosted_count", 0), fw.get("enabled", False)))
+    acs = result.get("anatomy_constraint_summary") or {}
+    if acs:
+        print("smoothing vs. anatomy constraint (mean per iteration): "
+             "proposed={0:.5f}  accepted={1:.5f}  ({2:.0f}% absorbed by anatomy)".format(
+             acs.get("mean_raw_proposal_displacement", 0.0),
+             acs.get("mean_net_accepted_displacement", 0.0),
+             100.0 * (1.0 - acs.get("mean_net_accepted_displacement", 0.0)
+                     / max(1e-9, acs.get("mean_raw_proposal_displacement", 0.0)))))
+        print("  vertices clearance-constrained: {0:.1f}/iteration ({1} total events, "
+             "mean correction {2:.5f} when applied)".format(
+             acs.get("mean_vertices_clearance_constrained_per_iteration", 0.0),
+             acs.get("total_clearance_constraint_events", 0),
+             acs.get("mean_clearance_correction_when_applied", 0.0)))
     dist = result.get("min_exact_anatomy_distance") or {}
     print("min exact anatomy distance: {0:.4f} -> {1:.4f}".format(
         dist.get("before", float("inf")), dist.get("after", float("inf"))))

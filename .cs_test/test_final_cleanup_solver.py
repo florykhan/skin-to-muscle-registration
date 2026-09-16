@@ -826,6 +826,55 @@ try:
     check("uniform path is marked disabled",
           result_off["fairing_weight"]["enabled"] is False)
 
+    print("\nD5. anatomy_constraint_summary: proposed vs. accepted vs. "
+         "vertices clearance-constrained (diagnoses weak-smoothing vs. "
+         "anatomy-is-absorbing-it, without re-deriving anything already logged)")
+    store["verts"] = [list(p) for p in positions0]
+    result_diag = fcs.run_final_fairing(
+        "grid_skin", ["floor"], indices=[center_v], anatomy_backend=backend2,
+        target_offset=0.3, min_clearance=0.1, transition_rings=1,
+        method="taubin", max_iterations=10, convergence_patience=8,
+        apply=False, verbose=False, create_backup=False, save_json=False, save_csv=False)
+    acs = result_diag.get("anatomy_constraint_summary") or {}
+    check("anatomy_constraint_summary has all requested fields",
+          all(k in acs for k in (
+              "mean_raw_proposal_displacement", "mean_net_accepted_displacement",
+              "mean_vertices_clearance_constrained_per_iteration",
+              "total_clearance_constraint_events",
+              "mean_clearance_correction_when_applied")),
+          str(acs))
+    check("mean raw proposal displacement is a real, nonzero number here "
+         "(the spike scenario genuinely proposes movement)",
+         acs.get("mean_raw_proposal_displacement", 0.0) > 0.0, str(acs))
+    check("all summary values are non-negative",
+          all(v >= 0 for v in acs.values()), str(acs))
+
+    print("\nD6. minimal repair footprint (repair_blend_rings=1) is a plain "
+         "pass-through to the EXISTING repair machinery -- still resolves a "
+         "real intersection safely, no new repair code involved")
+    positions0_d6 = [list(p) for p in positions0]
+    for i in range(len(positions0_d6)):
+        positions0_d6[i][1] = 0.5
+    positions0_d6[center_v][1] = -0.3  # dips through the anatomy plane again
+    store["verts"] = [list(p) for p in positions0_d6]
+    store["written"] = False
+    result_minrepair = fcs.run_final_fairing(
+        "grid_skin", ["floor"], indices=[center_v], anatomy_backend=backend2,
+        target_offset=0.1, min_clearance=0.1, transition_rings=1,
+        boundary_buffer_rings=0, repair_kwargs={"repair_blend_rings": 1},
+        method="taubin", max_iterations=40, convergence_patience=3,
+        apply=True, verbose=False, create_backup=False, save_json=False, save_csv=False)
+    check("a real pre-existing intersection was there to repair",
+          result_minrepair["feasibility"]["pre_intersections"]["face_count"] > 0,
+          str(result_minrepair["feasibility"]))
+    check("minimal-footprint repair still fully resolves it (0 forbidden "
+         "intersections at the end -- the safety GATE is unchanged, only the "
+         "repair's own neighbourhood size is smaller)",
+         result_minrepair["intersections"]["after"]["pair_count"] == 0,
+         str(result_minrepair["intersections"]))
+    check("protected boundary still untouched with the smaller repair footprint too",
+          all(store["verts"][b] == positions0_d6[b] for b in grid_boundary))
+
 finally:
     ac.get_boundary_vertices = _orig.pop("ac_get_boundary_vertices")
     for name, fn in _orig.items():

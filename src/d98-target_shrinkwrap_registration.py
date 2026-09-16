@@ -83,7 +83,7 @@ HELPER_DEBUG = True
 HELPER_MODULES = ("mesh_utils", "anatomy_constraint", "smoothing_utils",
                   "region_selection", "metrics_utils", "maya_io",
                   "artifact_detection", "cleanup_pipeline",
-                  "final_cleanup_solver")
+                  "final_cleanup_solver", "pure_laplacian_smoothing")
 HELPERS_AVAILABLE = False
 
 # Placeholders so these names always exist (reassigned to real modules on load).
@@ -96,6 +96,7 @@ maya_io = None
 artifact_detection = None
 cleanup_pipeline = None
 final_cleanup_solver = None
+pure_laplacian_smoothing = None
 
 
 def _dir_has_helpers(d):
@@ -4029,6 +4030,144 @@ def print_final_fairing_report(result):
     return final_cleanup_solver.print_final_fairing_report(result)
 
 
+def run_aggressive_final_smoothing(skin_mesh=None, indices=None, cleanup_result=None,
+                                   max_iterations=30, apply=True,
+                                   anatomical_meshes=None, min_clearance=None,
+                                   target_offset=None, verbose=True, **kwargs):
+    """AGGRESSIVE finishing pass: broad, strong, shrinkage-resistant fairing
+    with a MINIMAL anatomy safety net, instead of ``run_final_skin_fairing``'s
+    more conservative/targeted defaults.
+
+    Same underlying engine (``final_cleanup_solver.run_final_fairing`` --
+    Taubin force, per-vertex trust region, real triangle/triangle checking,
+    local repair, best-safe-state tracking; NO M4, NO M5 forces, NO
+    redetection). This is a THIN preset on top of it, not a new pipeline:
+
+    * Taubin strength roughly 1.5x the normal default (``taubin_lambda=0.5``,
+      ``taubin_mu=-0.51``).
+    * Shape restraint cut to a fraction of normal (``w_shape=0.05``,
+      ``core_shape_scale=0.1``) -- the core is nearly free to fair; the
+      transition band still anchors identity at the region's own edge.
+    * The low-frequency reference is smoothed much harder
+      (``rest_reference_smoothing_iterations=25``, ``strength=0.5``), so
+      shape-restraint is pulling toward BROAD facial form, not a mild denoise
+      of the current (still ridge-containing) shape.
+    * ``roughness_weighting=False`` -- broad, uniform fairing across the whole
+      region, not surgical targeting of only the worst vertices.
+    * The triangle-intersection SAFETY CHECK itself is unchanged (never
+      disabled, never weakened -- this project's own history is why: a vertex
+      can look clear while an anatomy triangle still pierces its face). What
+      changes is the REPAIR FOOTPRINT when a violation is actually found:
+      ``repair_blend_rings=1`` instead of the default ~6-ring broad patch, so
+      an occasional local conflict gets a small, local correction (still the
+      robust anatomy-supported target, never the old spike-prone normal-push)
+      instead of a wide patch being reset and overwriting nearby smoothing
+      progress on every minor graze.
+
+    Diagnose from ``result["anatomy_constraint_summary"]`` whether smoothing
+    is weak or anatomy is absorbing most of the proposed motion, and from
+    ``result["roughness"]["percentiles_after"]`` (p50/p90/p95/p99/max) and
+    ``result["iterations_log"]`` (watch ``repair_displacement`` for spikes)
+    whether this setting is too strong, too weak, or about right. All knobs
+    above are still overridable via ``**kwargs`` if you need to dial it back.
+    """
+    if not _helpers_ready():
+        return
+    if final_cleanup_solver is None:
+        print("[aggressive_smoothing] final_cleanup_solver helper not loaded; "
+              "re-send d98 to reload helpers.")
+        return
+    if not _configure_m4_sdf_backend():
+        return
+    skin_mesh = skin_mesh or SKIN_MESH
+    anatomical_meshes = anatomical_meshes or INTERNAL_MESHES
+    if indices is None and cleanup_result is not None:
+        indices = cleanup_result.get("active_indices")
+    backend, _sdf_fn = _make_anatomy_backend(anatomical_meshes)
+    if backend is None:
+        print("[aggressive_smoothing] no anatomy meshes found; cannot run. "
+              "Check INTERNAL_MESHES.")
+        return
+    min_clearance = _default_min_clearance(min_clearance, target_offset)
+    repair_kwargs = kwargs.pop("repair_kwargs", None)
+    if repair_kwargs is None:
+        repair_kwargs = {"repair_blend_rings": 1}
+    kwargs.setdefault("taubin_lambda", 0.5)
+    kwargs.setdefault("taubin_mu", -0.51)
+    kwargs.setdefault("w_shape", 0.05)
+    kwargs.setdefault("core_shape_scale", 0.1)
+    kwargs.setdefault("rest_reference_smoothing_iterations", 25)
+    kwargs.setdefault("rest_reference_smoothing_strength", 0.5)
+    kwargs.setdefault("roughness_weighting", False)
+    kwargs.setdefault("max_step_edge_ratio", 0.65)
+    return final_cleanup_solver.run_final_fairing(
+        skin_mesh, anatomical_meshes, indices=indices, min_clearance=min_clearance,
+        target_offset=target_offset, anatomy_backend=backend,
+        repair_kwargs=repair_kwargs,
+        max_iterations=max_iterations, apply=apply, verbose=verbose, **kwargs)
+
+
+def run_pure_skin_smoothing(skin_mesh=None, indices=None, cleanup_result=None,
+                            roughness_percentile=75, growth_rings=3,
+                            strength=0.5, iterations=15, apply=True,
+                            **kwargs):
+    """EXPERIMENTAL / DIAGNOSTIC ONLY -- raw Jacobi Laplacian smoothing with
+    ZERO anatomy safety: no clearance projection, no triangle-intersection
+    checking, no repair, no M4/M5 forces, no trust region, no shape force, no
+    rest reference, no best-state rollback. Nothing resists the smoothing.
+
+    Thin delegate to ``pure_laplacian_smoothing.run_pure_laplacian_smoothing``,
+    a completely separate module from ``final_cleanup_solver`` -- this is NOT
+    another preset on the real fairing engine. It exists to answer one
+    diagnostic question: can plain Laplacian smoothing flatten the remaining
+    bumps at all, if nothing is allowed to push back? It is expected to shrink
+    the skin, move it into anatomy, and create intersections -- that is
+    acceptable for this test and is not treated as a failure.
+
+    ``indices``: explicit vertex indices to smooth. Or pass
+    ``cleanup_result`` (e.g. the dict returned by ``run_final_skin_cleanup``)
+    to reuse its ``active_indices``. If neither is given, vertices are chosen
+    automatically as the ``roughness_percentile`` worst by the same Laplacian
+    roughness metric used elsewhere, then grown by ``growth_rings`` with a
+    linear falloff (1.0 core -> 0.0 at the edge). Works from a fresh Maya
+    session with no dependency on prior globals (``result200``, etc).
+
+    Example::
+
+        exec(d98...)
+        r = run_pure_skin_smoothing(skin_mesh="skin_cloth_copy_v5_pull_back",
+                                    roughness_percentile=75, growth_rings=2,
+                                    strength=0.6, iterations=15, apply=True)
+        print_pure_laplacian_report(r)
+
+    ``strength`` directly scales every step with no hidden damping or
+    clamping: ``strength=1.0`` jumps a vertex fully to its neighbours'
+    centroid every iteration. See ``pure_laplacian_smoothing.py`` for the full
+    parameter list (``protect_boundary``, ``create_backup``, etc) via
+    ``**kwargs``.
+    """
+    if not _helpers_ready():
+        return
+    if pure_laplacian_smoothing is None:
+        print("[pure_smoothing] pure_laplacian_smoothing helper not loaded; "
+              "re-send d98 to reload helpers.")
+        return
+    skin_mesh = skin_mesh or SKIN_MESH
+    if indices is None and cleanup_result is not None:
+        indices = cleanup_result.get("active_indices")
+    return pure_laplacian_smoothing.run_pure_laplacian_smoothing(
+        skin_mesh, indices=indices, roughness_percentile=roughness_percentile,
+        growth_rings=growth_rings, strength=strength, iterations=iterations,
+        apply=apply, **kwargs)
+
+
+def print_pure_laplacian_report(result):
+    """Print the human-readable summary of a :func:`run_pure_skin_smoothing` result."""
+    if not _helpers_ready() or pure_laplacian_smoothing is None or not result:
+        return
+    return pure_laplacian_smoothing.print_pure_laplacian_report(result)
+
+
 def backup_skin_mesh(suffix="_precleanup"):
     """Duplicate the skin mesh as a backup before cleanup (name preserved)."""
     if not _helpers_ready():
@@ -4079,7 +4218,10 @@ if HELPERS_AVAILABLE:
     print("  run_final_skin_cleanup(max_iterations=200)            - FINAL unified fairing/anatomy-projection/repair solver (default path)")
     print("  print_final_cleanup_report(result)                    - pretty-print a run_final_skin_cleanup() result")
     print("  run_final_skin_fairing(cleanup_result=result, max_iterations=20) - FINISHING pass: Taubin + roughness-targeted weights")
-    print("  print_final_fairing_report(fair)                      - pretty-print a run_final_skin_fairing() result")
+    print("  run_aggressive_final_smoothing(cleanup_result=result, max_iterations=30) - strong broad Taubin + minimal 1-ring anatomy repair")
+    print("  print_final_fairing_report(fair)                      - pretty-print a run_final_skin_fairing()/run_aggressive_final_smoothing() result")
+    print("  run_pure_skin_smoothing(roughness_percentile=75, strength=0.6, iterations=15) - EXPERIMENTAL raw Jacobi Laplacian smoothing, ZERO anatomy safety")
+    print("  print_pure_laplacian_report(result)                   - pretty-print a run_pure_skin_smoothing() result")
     print("  cleanup_selected_region(strength=0.3, iterations=8)   - smooth viewport selection")
     print("  cleanup_named_region('lips', strength=0.3)            - smooth heuristic region")
     print("  backup_skin_mesh()                                    - duplicate skin before edits")
