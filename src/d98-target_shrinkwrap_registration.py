@@ -84,7 +84,7 @@ HELPER_MODULES = ("mesh_utils", "anatomy_constraint", "smoothing_utils",
                   "region_selection", "metrics_utils", "maya_io",
                   "artifact_detection", "cleanup_pipeline",
                   "final_cleanup_solver", "pure_laplacian_smoothing",
-                  "blocked_laplacian_smoothing")
+                  "blocked_laplacian_smoothing", "micro_clearance_push")
 HELPERS_AVAILABLE = False
 
 # Placeholders so these names always exist (reassigned to real modules on load).
@@ -99,6 +99,7 @@ cleanup_pipeline = None
 final_cleanup_solver = None
 pure_laplacian_smoothing = None
 blocked_laplacian_smoothing = None
+micro_clearance_push = None
 
 
 def _dir_has_helpers(d):
@@ -4241,6 +4242,66 @@ def print_blocked_laplacian_report(result):
     return blocked_laplacian_smoothing.print_blocked_laplacian_report(result)
 
 
+def run_micro_clearance_push(skin_mesh=None, indices=None, cleanup_result=None,
+                             target_clearance=0.15, blend_rings=1, apply=True,
+                             anatomical_meshes=None, **kwargs):
+    """FINAL, tiny post-process for a finished blocked-Laplacian result: a
+    ONE-SHOT local outward push on the very small number of closed-skin
+    regions where anatomy is still visible/too close. NOT another smoothing
+    pass and NOT the old broad repair pipeline -- it runs exactly once, only
+    touches the vertices of ACTUALLY forbidden skin/anatomy faces (the
+    existing true triangle/triangle detector, same eye/mouth/opening
+    exclusions) plus their immediate ``blend_rings`` topology ring, and stops.
+
+    Thin delegate to ``micro_clearance_push.run_micro_clearance_push``, a
+    completely separate module from ``pure_laplacian_smoothing``,
+    ``blocked_laplacian_smoothing``, and ``final_cleanup_solver`` -- it does
+    not import or modify any of them.
+
+    ``indices``: optionally scope the intersection scan (e.g. reuse
+    ``cleanup_result["active_indices"]``). If omitted (the normal case for a
+    final pass), the WHOLE mesh is scanned once. Works from a fresh Maya
+    session with no dependency on prior globals.
+
+    Example::
+
+        exec(d98...)
+        r = run_micro_clearance_push(skin_mesh="skin_cloth_copy_v5_pull_back",
+                                     target_clearance=0.15, blend_rings=1,
+                                     apply=True)
+        print_micro_clearance_report(r)
+
+    See ``micro_clearance_push.py`` for the full parameter list
+    (``protect_boundary``, ``boundary_buffer_rings``,
+    ``intersection_tolerance``, ``max_constraint_iterations``,
+    ``clearance_tolerance``, ``create_backup``, ...) via ``**kwargs``.
+    """
+    if not _helpers_ready():
+        return
+    if micro_clearance_push is None:
+        print("[micro_clearance_push] micro_clearance_push helper not loaded; "
+              "re-send d98 to reload helpers.")
+        return
+    skin_mesh = skin_mesh or SKIN_MESH
+    anatomical_meshes = anatomical_meshes or INTERNAL_MESHES
+    if indices is None and cleanup_result is not None:
+        indices = cleanup_result.get("active_indices")
+    backend, _sdf_fn = _make_anatomy_backend(anatomical_meshes)
+    if backend is None:
+        print("[micro_clearance_push] no anatomy meshes found; cannot run. Check INTERNAL_MESHES.")
+        return
+    return micro_clearance_push.run_micro_clearance_push(
+        skin_mesh, backend, indices=indices, target_clearance=target_clearance,
+        blend_rings=blend_rings, apply=apply, **kwargs)
+
+
+def print_micro_clearance_report(result):
+    """Print the human-readable summary of a :func:`run_micro_clearance_push` result."""
+    if not _helpers_ready() or micro_clearance_push is None or not result:
+        return
+    return micro_clearance_push.print_micro_clearance_report(result)
+
+
 def backup_skin_mesh(suffix="_precleanup"):
     """Duplicate the skin mesh as a backup before cleanup (name preserved)."""
     if not _helpers_ready():
@@ -4297,6 +4358,8 @@ if HELPERS_AVAILABLE:
     print("  print_pure_laplacian_report(result)                   - pretty-print a run_pure_skin_smoothing() result")
     print("  run_blocked_skin_smoothing(strength=0.35, iterations=10, freeze_rings=1) - EXPERIMENTAL Jacobi smoothing + local freeze-on-intersection")
     print("  print_blocked_laplacian_report(result)                - pretty-print a run_blocked_skin_smoothing() result")
+    print("  run_micro_clearance_push(target_clearance=0.15, blend_rings=1) - FINAL one-shot local outward push on remaining forbidden regions")
+    print("  print_micro_clearance_report(result)                  - pretty-print a run_micro_clearance_push() result")
     print("  cleanup_selected_region(strength=0.3, iterations=8)   - smooth viewport selection")
     print("  cleanup_named_region('lips', strength=0.3)            - smooth heuristic region")
     print("  backup_skin_mesh()                                    - duplicate skin before edits")
