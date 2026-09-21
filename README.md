@@ -34,8 +34,6 @@ The central finding of the cleanup research: a deliberately unconstrained **pure
 
 # 🖼 Pipeline Overview
 
-![Research pipeline overview](assets/figures/pipeline.png)
-
 Example flow:
 
 ```
